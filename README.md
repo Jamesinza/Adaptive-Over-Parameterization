@@ -40,6 +40,13 @@ Expect refactors, dead ends, and aggressive changes.
   <li>A replacement for principled architecture design</li>
 </ul>
 
+<h2>Why This Repo Exists</h2>
+<p>
+This repository exists to document experiments, not to sell conclusions.
+If you are working on dynamic capacity, non-stationary learning,
+or unconventional optimization strategies, this may be useful.
+</p>
+
 <h3>Core Idea</h3>
 <pre>
 Over-parameterize →
