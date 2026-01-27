@@ -19,6 +19,13 @@ than from constraint.
   <li>Static model capacity in non-stationary environments</li>
 </ul>
 
+<h2>Why This Might Fail</h2>
+<ul>
+  <li>Over-parameterization may encode spurious correlations</li>
+  <li>Pruning signals may lag true feature importance</li>
+  <li>Optimization noise could masquerade as usefulness</li>
+</ul>
+
 <h3>Core Idea</h3>
 <pre>
 Over-parameterize →
@@ -27,3 +34,9 @@ Measure utility →
 Prune aggressively →
 Repeat
 </pre>
+
+<blockquote>
+Capacity first. Structure later. Prune without mercy.
+</blockquote>
+
+
