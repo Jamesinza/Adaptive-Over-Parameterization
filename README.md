@@ -1,1 +1,2 @@
+# Adaptive-Over-Parameterization
 The idea behind these experiments is to over paramatize the model during training and then prune what is not needed. My thinking at the time was that often essential information is mixed with useless information but models are often forced to navigate their way through both to achieve optimum results.
