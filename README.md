@@ -12,6 +12,13 @@ then optimal representations emerge more reliably from excess
 than from constraint.
 </p>
 
+<h2>Project Status</h2>
+<p>
+Exploratory research code.
+Ideas are tested through iterative experiments rather than polished APIs.
+Expect refactors, dead ends, and aggressive changes.
+</p>
+
 <h2>What This Pushes Against</h2>
 <ul>
   <li>Premature architectural minimalism</li>
