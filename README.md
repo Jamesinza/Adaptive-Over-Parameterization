@@ -33,6 +33,13 @@ Expect refactors, dead ends, and aggressive changes.
   <li>Optimization noise could masquerade as usefulness</li>
 </ul>
 
+<h2>What This Is Not</h2>
+<ul>
+  <li>A production-ready library</li>
+  <li>A claim of universal improvement</li>
+  <li>A replacement for principled architecture design</li>
+</ul>
+
 <h3>Core Idea</h3>
 <pre>
 Over-parameterize →
