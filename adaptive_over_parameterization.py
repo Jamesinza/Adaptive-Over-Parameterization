@@ -1,79 +1,102 @@
 """
-Adaptive Overparameterization Experiment — Emergent Phase Enhancements
+Adaptive Overparameterization Experiment — Transformer Backbone + NumPy-driven evaluation
 
-Additions in this version:
-- Router temperature annealing via Keras Callback (AnnealCallback).
-- Router and gate statistics logged to TensorBoard each epoch (mean logits, mean gate activation, gate entropy).
-- Pareto-aware pruning: compressor applies pruning only when it improves an efficiency metric (val_loss * (1 + alive_ratio)); otherwise pruning is relaxed.
-- Compressor now records and logs per-layer Fisher means to TensorBoard for diagnostics.
-- Startup debug prints listing discovered MaskedDense and Router layers and their initial alive counts.
+This version applies the following changes:
+- Replaces tf.data pipelines with plain NumPy arrays for training/validation to avoid iterator exhaustion.
+- capture_activations and approx_fisher_per_sample accept either a tf.data.Dataset or a (X_np, Y_np) tuple.
+- Robust, unique-keyed monkeypatch capture for MaskedDense (context manager).
+- Utilities preserved: get_masked_dense_layers, compute_activation_entropy, visualization, EvoCompressor.
 
-Usage: run the same script. Keep CONFIG defaults or reduce sizes for quick experiments.
 """
 
 import os
+import math
+import random
 import numpy as np
 import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
+from contextlib import contextmanager
+import keras
 import pandas as pd
 import datetime
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 
 # -----------------------------
-# Config
+# Config / seeds
 # -----------------------------
 SEED = 42
+random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
+# -----------------------------
+# Dataset helpers
+# -----------------------------
+
+def make_dataset(data, n, seq_len):
+    X = np.empty([n - seq_len, seq_len, 1], dtype=np.float32)
+    Y = np.empty([n - seq_len], dtype=np.float32)
+    for i in range(n - seq_len):
+        X[i] = data[i:i + seq_len]
+        Y[i] = data.flatten()[i + seq_len]
+    return X, Y
+
+def compute_batch_size(dataset_length: int) -> int:
+    base_unit = 24_576
+    base_batch = 32
+    scale = math.ceil(max(1, dataset_length) / base_unit)
+    return int(base_batch * scale)
+
+def numpy_batch_iter(X, Y, batch_size):
+    n = len(X)
+    for i in range(0, n, batch_size):
+        yield X[i:i+batch_size], Y[i:i+batch_size]
+
+# -----------------------------
+# Load data
+# -----------------------------
+raw_df = pd.read_csv('datasets/EURUSD_M1_245.csv')
+df = raw_df.tail(10_000).copy()
+df = df[df['High'] != df['Low']]
+df.dropna(inplace=True)
+df.reset_index(inplace=True, drop=True)
+data = df[['Close']].values
+
+split = 1000
+train_data = data[:-split]
+val_data = data[-split:]
+
+batch_size = compute_batch_size(len(train_data))
+
 CONFIG = {
-    'seq_len': 50,
-    'train_size': 3000,
-    'val_size': 600,
-    'batch_size': 64,
-    'epochs_per_phase': 6,
-    'cycles': 4,
-    'prune_fraction': 0.20,
-    'regrow_fraction': 0.20,
-    'hidden_units': 1024,
-    'hidden_layers': 3,
-    'num_heads': 8,
-    'ffn_mult': 4,
+    'seq_len': 8,
+    'train_size': len(train_data),
+    'val_size': len(val_data),
+    'batch_size': batch_size,
+    'epochs_per_phase': 5,
+    'cycles': 8,
+    'prune_fraction': 0.30,
+    'regrow_fraction': 0.30,
+    'd_model': 32,
+    'hidden_units': 128,
+    'hidden_layers': 2,
+    'num_heads': 2,
+    # 'ffn_mult': 4,
     'learning_rate': 1e-3,
     'max_fisher_samples_per_batch': 8,
-    'anneal_start_temp': 1.0,
-    'anneal_end_temp': 0.1,
-    'anneal_epochs_total': 100,  # used by AnnealCallback schedule
     'log_dir': './logs/adaptive_overparam_' + datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
 }
 
 os.makedirs(CONFIG['log_dir'], exist_ok=True)
 
-# -----------------------------
-# Dataset
-# -----------------------------
+X_train, Y_train = make_dataset(train_data, CONFIG['train_size'], CONFIG['seq_len'])
+X_val, Y_val = make_dataset(val_data, CONFIG['val_size'], CONFIG['seq_len'])
 
-def make_dataset(n, seq_len):
-    X = np.zeros((n, seq_len, 1), dtype=np.float32)
-    Y = np.zeros((n, 1), dtype=np.float32)
-    for i in range(n):
-        base_freq = np.random.uniform(0.5, 2.0)
-        amp = np.random.uniform(0.6, 1.4)
-        phase = np.random.uniform(0, 2*np.pi)
-        t = np.linspace(0, 6, seq_len + 1)
-        sig = amp * np.sin(2*np.pi*base_freq * t + phase)
-        sig += 0.08 * np.random.randn(len(t))
-        X[i, :, 0] = sig[:-1]
-        Y[i, 0] = sig[-1]
-    return X, Y
+# Use NumPy tuples instead of tf.data pipelines to avoid exhaustion issues while prototyping
+train_ds = (X_train, Y_train)
+val_ds = (X_val, Y_val)
 
-X_train, Y_train = make_dataset(CONFIG['train_size'], CONFIG['seq_len'])
-X_val, Y_val = make_dataset(CONFIG['val_size'], CONFIG['seq_len'])
-
-train_ds = tf.data.Dataset.from_tensor_slices((X_train, Y_train)).shuffle(2000).batch(CONFIG['batch_size'])
-val_ds = tf.data.Dataset.from_tensor_slices((X_val, Y_val)).batch(CONFIG['batch_size'])
+print('Train samples:', len(X_train), 'Val samples:', len(X_val), 'Batch size:', CONFIG['batch_size'])
 
 # -----------------------------
 # Positional Encoding
@@ -82,7 +105,7 @@ val_ds = tf.data.Dataset.from_tensor_slices((X_val, Y_val)).batch(CONFIG['batch_
 def positional_encoding(seq_len, d_model):
     pos = np.arange(seq_len)[:, np.newaxis]
     i = np.arange(d_model)[np.newaxis, :]
-    angle_rates = 1 / np.power(10000, (2 * (i//2)) / np.float32(d_model))
+    angle_rates = 1 / np.power(10000, (2 * (i // 2)) / np.float32(d_model))
     angle_rads = pos * angle_rates
     pe = np.zeros((seq_len, d_model))
     pe[:, 0::2] = np.sin(angle_rads[:, 0::2])
@@ -90,9 +113,10 @@ def positional_encoding(seq_len, d_model):
     return tf.cast(pe, dtype=tf.float32)
 
 # -----------------------------
-# Masked Dense
+# Masked Dense (serializable)
 # -----------------------------
-class MaskedDense(layers.Layer):
+@keras.utils.register_keras_serializable(package="Custom")
+class MaskedDense(keras.layers.Layer):
     def __init__(self, units, activation=None, name=None):
         super().__init__(name=name)
         self.units = int(units)
@@ -116,7 +140,7 @@ class MaskedDense(layers.Layer):
         self.mask = self.add_weight(
             name='mask',
             shape=(self.units,),
-            initializer=tf.keras.initializers.Constant(1.0),
+            initializer=keras.initializers.Constant(1.0),
             trainable=False
         )
 
@@ -153,9 +177,10 @@ class MaskedDense(layers.Layer):
         return {'units': self.units, 'activation': keras.activations.serialize(self.activation)}
 
 # -----------------------------
-# Router
+# Router (Concrete)
 # -----------------------------
-class Router(layers.Layer):
+@keras.utils.register_keras_serializable(package="Custom")
+class Router(keras.layers.Layer):
     def __init__(self, units, temp=0.5, name=None):
         super().__init__(name=name)
         self.units = int(units)
@@ -180,63 +205,82 @@ class Router(layers.Layer):
     def set_temp(self, t):
         self.temp.assign(float(t))
 
+    def get_config(self):
+         return {'units': int(self.units), 'temp': float(self.temp.numpy() if hasattr(self.temp, 'numpy') else self.temp)}
+
 # -----------------------------
-# TransformerBlock
+# Transformer block
 # -----------------------------
-class TransformerBlock(layers.Layer):
-    def __init__(self, d_model, num_heads, ff_dim, name=None):
+@keras.utils.register_keras_serializable(package="Custom")
+class TransformerBlock(keras.layers.Layer):
+    def __init__(self, d_model, num_heads, ff_dim, drop_rate=0.1, name=None):
         super().__init__(name=name)
-        self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model // num_heads)
-        self.norm1 = layers.LayerNormalization()
-        self.norm2 = layers.LayerNormalization()
-        self.ffn_dense1 = MaskedDense(ff_dim, activation='relu', name='ffn_dense1')
-        self.ffn_dense2 = MaskedDense(d_model, activation=None, name='ffn_dense2')
-        self.dropout = layers.Dropout(0.1)
-        self.router = Router(units=ff_dim, temp=CONFIG['anneal_start_temp'], name='router')
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.ff_dim = ff_dim
+        self.drop_rate = drop_rate
+        self.att = keras.layers.MultiHeadAttention(num_heads=self.num_heads, key_dim=self.d_model // self.num_heads)
+        self.norm1 = keras.layers.LayerNormalization()
+        self.norm2 = keras.layers.LayerNormalization()
+        self.ffn_dense1 = MaskedDense(self.ff_dim, activation='gelu', name='ffn_dense1')
+        self.ffn_dense2 = MaskedDense(self.d_model, activation=None, name='ffn_dense2')
+        self.dropout = keras.layers.Dropout(self.drop_rate)
+        self.router = Router(units=self.ff_dim, temp=0.5, name='router')
 
     def call(self, x, training=False):
         attn_out = self.att(x, x, x)
         x = self.norm1(x + attn_out)
-        pooled = tf.reduce_mean(x, axis=1)
-        gates = self.router(pooled, training=training)
+        pooled = tf.reduce_mean(x, axis=1)  # (batch, d_model)
+        gates = self.router(pooled, training=training)  # (batch, ff_dim)
         seq_len = tf.shape(x)[1]
         x_flat = tf.reshape(x, (-1, tf.shape(x)[-1]))
         pre, h = self.ffn_dense1(x_flat, return_pre_activation=True)
         gates_exp = tf.repeat(gates, repeats=seq_len, axis=0)
         h = h * gates_exp
         h2 = self.ffn_dense2(h)
-        h2 = tf.reshape(h2, (-1, seq_len, tf.shape(x)[2]))
+        # h2 = tf.reshape(h2, (-1, seq_len, tf.shape(x)[2]))
+        h2 = tf.reshape(h2, (-1, seq_len, self.d_model))
         x = self.norm2(x + h2)
         return x
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'d_model': self.d_model,
+                       'num_heads': self.num_heads,
+                       'ff_dim': self.ff_dim,
+                       'drop_rate': self.drop_rate
+                      })
+        return config
 
 # -----------------------------
 # Model builder
 # -----------------------------
 
 def build_transformer_model(seq_len, d_model, num_layers, num_heads, ff_dim):
-    inp = layers.Input(shape=(seq_len, 1))
-    x = layers.Dense(d_model)(inp)
+    inp = keras.layers.Input(shape=(seq_len, 1))
+    x = keras.layers.TimeDistributed(keras.layers.Dense(d_model))(inp)
     pe = positional_encoding(seq_len, d_model)
     x = x + pe
     for i in range(num_layers):
         x = TransformerBlock(d_model=d_model, num_heads=num_heads, ff_dim=ff_dim, name=f'transformer_block_{i}')(x)
-    x = layers.GlobalAveragePooling1D()(x)
-    out = layers.Dense(1, name='head')(x)
+    x = keras.layers.GlobalAveragePooling1D()(x)
+    out = keras.layers.Dense(1, name='head')(x)
     model = keras.Model(inp, out)
     return model
 
-D_MODEL = 64
-model = build_transformer_model(CONFIG['seq_len'], d_model=D_MODEL, num_layers=CONFIG['hidden_layers'], num_heads=CONFIG['num_heads'], ff_dim=CONFIG['hidden_units'])
-optim = keras.optimizers.Adam(CONFIG['learning_rate'])
-model.compile(optim, loss='mse', metrics=['mae'])
+model = build_transformer_model(CONFIG['seq_len'], d_model=CONFIG['d_model'], num_layers=CONFIG['hidden_layers'],
+                                num_heads=CONFIG['num_heads'], ff_dim=CONFIG['hidden_units'])
+optim = keras.optimizers.AdamW(CONFIG['learning_rate'])
+model.compile(optim, loss='huber', metrics=['mae'])
+model.summary()
 
 # -----------------------------
-# Robust discovery utilities
+# Utilities: robust discovery of MaskedDense sublayers (recursive)
 # -----------------------------
-
 def get_masked_dense_layers(model):
     visited = set()
     found = []
+
     def walk(layer):
         if id(layer) in visited:
             return
@@ -246,7 +290,7 @@ def get_masked_dense_layers(model):
                 found.append(layer)
         except Exception:
             pass
-        for attr in ("layers", "submodules", "_layers"):
+        for attr in ("layers", "submodules", "_layers", "_saved_model_inputs_spec"):
             children = getattr(layer, attr, None)
             if not children:
                 continue
@@ -257,11 +301,13 @@ def get_masked_dense_layers(model):
                     walk(child)
             except Exception:
                 pass
+
     if hasattr(model, "layers") and getattr(model, "layers"):
         for top in model.layers:
             walk(top)
-    else:
-        walk(model)
+    # also guard-walk the model object itself to catch other nesting
+    walk(model)
+
     out = []
     seen = set()
     for l in found:
@@ -271,187 +317,287 @@ def get_masked_dense_layers(model):
         seen.add(id(l))
     return out
 
-
-def get_router_layers(model):
-    visited = set()
-    found = []
-    def walk(layer):
-        if id(layer) in visited:
-            return
-        visited.add(id(layer))
-        try:
-            if isinstance(layer, Router):
-                found.append(layer)
-        except Exception:
-            pass
-        for attr in ("layers", "submodules", "_layers"):
-            children = getattr(layer, attr, None)
-            if not children:
-                continue
-            try:
-                for child in children:
-                    if child is layer:
-                        continue
-                    walk(child)
-            except Exception:
-                pass
-    if hasattr(model, "layers") and getattr(model, "layers"):
-        for top in model.layers:
-            walk(top)
-    else:
-        walk(model)
-    out = []
-    seen = set()
-    for l in found:
-        if id(l) in seen:
-            continue
-        out.append(l)
-        seen.add(id(l))
-    return out
-
-
-def get_transformer_blocks(model):
-    # find TransformerBlock instances (parents of routers) defensively
-    visited = set()
-    found = []
-    def walk(layer):
-        if id(layer) in visited:
-            return
-        visited.add(id(layer))
-        try:
-            if isinstance(layer, TransformerBlock):
-                found.append(layer)
-        except Exception:
-            pass
-        for attr in ("layers", "submodules", "_layers"):
-            children = getattr(layer, attr, None)
-            if not children:
-                continue
-            try:
-                for child in children:
-                    if child is layer:
-                        continue
-                    walk(child)
-            except Exception:
-                pass
-    if hasattr(model, "layers") and getattr(model, "layers"):
-        for top in model.layers:
-            walk(top)
-    else:
-        walk(model)
-    out = []
-    seen = set()
-    for l in found:
-        if id(l) in seen:
-            continue
-        out.append(l)
-        seen.add(id(l))
-    return out
-
-
-def get_router_info(model):
-    """Return list of dicts: {'router': router_layer, 'block': block_layer, 'pooled_submodel': submodel}
-    pooled_submodel maps model.input -> pooled context used by that block's router (reduce_mean over block input).
+# -----------------------------
+# Capture monkeypatch helper for subclassed MaskedDense
+# -----------------------------
+@contextmanager
+def capture_maskeddense_outputs(masked_layers):
     """
-    infos = []
-    blocks = get_transformer_blocks(model)
-    for blk in blocks:
-        r = getattr(blk, 'router', None)
-        if r is None:
-            continue
-        # try to build a submodel that outputs the pooled context used by the router
-        try:
-            # blk.input is symbolic tensor (batch, seq_len, d_model)
-            pooled_tensor = tf.reduce_mean(blk.input, axis=1)
-            pooled_submodel = keras.Model(model.input, pooled_tensor)
-        except Exception:
-            pooled_submodel = None
-        infos.append({'router': r, 'block': blk, 'pooled_submodel': pooled_submodel})
-    return infos
+    Monkeypatch MaskedDense.call on the provided instances and record outputs.
+    Records are keyed by unique_key = f"{layer.name}_{hex(id(layer))}".
+    The wrapper calls the original bound method exactly and returns its result unchanged.
+    Caller should enable eager mode (tf.config.run_functions_eagerly(True)) when needed.
+    """
+    records = {}
+    originals = {}
 
-# -----------------------------
-# Router logging: use pooled submodels to obtain correct router inputs
-# -----------------------------
-class AnnealCallback(keras.callbacks.Callback):
-    def __init__(self, routers, start_temp, end_temp, total_epochs):
-        super().__init__()
-        self.routers = routers
-        self.start_temp = float(start_temp)
-        self.end_temp = float(end_temp)
-        self.total_epochs = float(total_epochs)
+    for layer in masked_layers:
+        key = f"{layer.name}_{hex(id(layer))}"
+        records[key] = []
+        originals[key] = layer.call  # bound method
 
-    def on_epoch_end(self, epoch, logs=None):
-        # linear anneal from start_temp to end_temp
-        frac = min(1.0, epoch / max(1.0, self.total_epochs))
-        t = self.start_temp + (self.end_temp - self.start_temp) * frac
-        for r in self.routers:
-            try:
-                r.set_temp(t)
-            except Exception:
-                pass
-
-
-class RouterLoggingCallback(keras.callbacks.Callback):
-    def __init__(self, router_infos, val_ds, tb_writer):
-        super().__init__()
-        # router_infos: list of dicts from get_router_info() with keys 'router' and 'pooled_submodel'
-        self.router_infos = router_infos
-        self.val_ds = val_ds
-        self.tb_writer = tb_writer
-
-    def on_epoch_end(self, epoch, logs=None):
-        mean_logits = []
-        mean_gates = []
-        gate_entropy = []
-        # iterate a single batch for speed
-        for x, y in self.val_ds:
-            for info in self.router_infos:
-                r = info.get('router')
-                pooled_sub = info.get('pooled_submodel')
-                if r is None or pooled_sub is None:
-                    continue
+        def make_wrapper(orig_method, layer, key):
+            def wrapper(inputs, *args, **kwargs):
+                # Call the original bound method exactly
+                res = orig_method(inputs, *args, **kwargs)
+                # Decide what to record: if (pre,out) then record out, else record res
                 try:
-                    pooled = pooled_sub(x, training=False)  # (batch, d_model)
-                    g = r(pooled, training=False)  # (batch, units)
+                    if isinstance(res, (tuple, list)) and len(res) == 2:
+                        out_tensor = res[1]
+                    else:
+                        out_tensor = res
                 except Exception:
-                    continue
-                # compute approximate logits (numerically stable)
-                g_clipped = tf.clip_by_value(g, 1e-6, 1.0 - 1e-6)
-                logits_approx = tf.math.log(g_clipped) - tf.math.log(1.0 - g_clipped)
-                mean_logits.append(tf.reduce_mean(logits_approx).numpy())
-                mean_gates.append(tf.reduce_mean(g).numpy())
-                p = g.numpy()
-                ent = -np.mean(np.sum(p * np.log(p + 1e-9) + (1 - p) * np.log(1 - p + 1e-9), axis=1))
-                gate_entropy.append(ent)
-            break
-        with (self.tb_writer.as_default() if self.tb_writer is not None else tf.summary.create_file_writer(os.path.join(CONFIG['log_dir'],'custom')).as_default()):
-            tf.summary.scalar('router/mean_logit', float(np.mean(mean_logits)) if mean_logits else 0.0, step=epoch)
-            tf.summary.scalar('router/mean_gate', float(np.mean(mean_gates)) if mean_gates else 0.0, step=epoch)
-            tf.summary.scalar('router/gate_entropy', float(np.mean(gate_entropy)) if gate_entropy else 0.0, step=epoch)
+                    out_tensor = res
+                # Try converting to numpy if eager; otherwise store tensor object
+                try:
+                    records[key].append(out_tensor.numpy())
+                except Exception:
+                    records[key].append(out_tensor)
+                return res
+            return wrapper
+
+        layer.call = make_wrapper(originals[key], layer, key)
+
+    try:
+        yield records
+    finally:
+        # restore
+        for layer in masked_layers:
+            key = f"{layer.name}_{hex(id(layer))}"
+            if key in originals:
+                layer.call = originals[key]
 
 # -----------------------------
-# Training + cycles (integrate everything)
+# Capture activations (NumPy-aware)
+# -----------------------------
+def capture_activations(model, dataset, masked_layers=None, batch_size=None):
+    """
+    Capture activations for MaskedDense layers.
+    dataset may be a tf.data.Dataset or a tuple (X_np, Y_np).
+    Returns dict keyed by unique instance key: { 'ffn_dense1_0xabc': np.array([...]) , ... }
+    """
+    if masked_layers is None:
+        masked_layers = get_masked_dense_layers(model)
+    if len(masked_layers) == 0:
+        return {}
+    if batch_size is None:
+        batch_size = CONFIG['batch_size']
 
+    submodels = {}
+    acts = {}
+    for l in masked_layers:
+        key = f"{l.name}_{hex(id(l))}"
+        acts[key] = []
+        try:
+            submodels[key] = keras.Model(model.input, l.output)
+        except Exception:
+            submodels[key] = None
+
+    need_monkey = [l for l in masked_layers if submodels.get(f"{l.name}_{hex(id(l))}") is None]
+
+    # choose iterator
+    if isinstance(dataset, tuple) and isinstance(dataset[0], np.ndarray):
+        batch_iter = numpy_batch_iter(dataset[0], dataset[1], batch_size)
+    else:
+        batch_iter = iter(dataset)
+
+    seen_any = False
+    for x, y in batch_iter:
+        seen_any = True
+        x_tf = tf.convert_to_tensor(x)
+
+        # functional submodels
+        for l in masked_layers:
+            key = f"{l.name}_{hex(id(l))}"
+            sm = submodels.get(key)
+            if sm is None:
+                continue
+            try:
+                a = sm(x_tf, training=False).numpy()
+            except Exception:
+                continue
+            if a.ndim == 3:
+                a = a.reshape(a.shape[0] * a.shape[1], a.shape[2])
+            acts[key].append(a)
+
+        # monkeypatch path
+        if need_monkey:
+            prev = tf.config.functions_run_eagerly()
+            tf.config.run_functions_eagerly(True)
+            try:
+                with capture_maskeddense_outputs(need_monkey) as records:
+                    _ = model(x_tf, training=False)
+                    for l in need_monkey:
+                        key = f"{l.name}_{hex(id(l))}"
+                        outs = records.get(key, [])
+                        if not outs:
+                            continue
+                        arrs = []
+                        for o in outs:
+                            if isinstance(o, np.ndarray):
+                                o_np = o
+                            else:
+                                try:
+                                    o_np = o.numpy()
+                                except Exception:
+                                    continue
+                            if o_np.ndim == 3:
+                                o_np = o_np.reshape(o_np.shape[0] * o_np.shape[1], o_np.shape[2])
+                            arrs.append(o_np)
+                        if arrs:
+                            acts[key].append(np.concatenate(arrs, axis=0))
+            finally:
+                tf.config.run_functions_eagerly(prev)
+
+    if not seen_any:
+        print('capture_activations: WARNING - dataset yielded zero batches (empty or exhausted).')
+        final = {}
+        for l in masked_layers:
+            key = f"{l.name}_{hex(id(l))}"
+            final[key] = np.zeros((0, l.units), dtype=np.float32)
+        return final
+
+    final = {}
+    for l in masked_layers:
+        key = f"{l.name}_{hex(id(l))}"
+        if len(acts[key]) == 0:
+            final[key] = np.zeros((0, l.units), dtype=np.float32)
+        else:
+            final[key] = np.concatenate(acts[key], axis=0)
+    return final
+
+# -----------------------------
+# Activation entropy
+# -----------------------------
+def compute_activation_entropy(activations, eps=1e-9):
+    if activations.size == 0:
+        return np.array([])
+    n_samples, units = activations.shape
+    ent = np.zeros((units,), dtype=np.float32)
+    for u in range(units):
+        vals = activations[:, u]
+        vmin, vmax = vals.min(), vals.max()
+        if vmax - vmin < 1e-6:
+            ent[u] = 0.0
+            continue
+        bins = np.histogram_bin_edges(vals, bins='auto')
+        hist, _ = np.histogram(vals, bins=bins)
+        p = hist / (hist.sum() + eps)
+        p = p[p > 0]
+        ent[u] = -np.sum(p * np.log(p))
+    return ent
+
+# -----------------------------
+# Improved Fisher: per-sample gradients wrt layer outputs (NumPy-aware)
+# -----------------------------
+def approx_fisher_per_sample(model, dataset, loss_fn, max_samples_per_batch=8, batch_size=None):
+    md_layers = get_masked_dense_layers(model)
+    if batch_size is None:
+        batch_size = CONFIG['batch_size']
+
+    submodels = {}
+    for l in md_layers:
+        key = f"{l.name}_{hex(id(l))}"
+        try:
+            submodels[key] = keras.Model(model.input, l.output)
+        except Exception:
+            submodels[key] = None
+
+    fisher = {f"{l.name}_{hex(id(l))}": np.zeros((l.units,), dtype=np.float32) for l in md_layers}
+    count = 0
+
+    # choose iterator
+    if isinstance(dataset, tuple) and isinstance(dataset[0], np.ndarray):
+        batch_iter = numpy_batch_iter(dataset[0], dataset[1], batch_size)
+    else:
+        batch_iter = iter(dataset)
+
+    for x_batch, y_batch in batch_iter:
+        x_batch_tf = tf.convert_to_tensor(x_batch)
+        y_batch_tf = tf.convert_to_tensor(y_batch)
+        batch_size_real = x_batch.shape[0]
+        n_samples = int(min(batch_size_real, max_samples_per_batch))
+        for i in range(n_samples):
+            x = x_batch_tf[i:i + 1]
+            y = y_batch_tf[i:i + 1]
+            with tf.GradientTape() as tape:
+                preds = model(x, training=False)
+                outs = {}
+                for l in md_layers:
+                    key = f"{l.name}_{hex(id(l))}"
+                    subm = submodels.get(key, None)
+                    if subm is None:
+                        continue
+                    out = subm(x)
+                    tape.watch(out)
+                    outs[key] = out
+                loss = loss_fn(y, preds)
+            for key, out in outs.items():
+                grad = tape.gradient(loss, out)
+                if grad is None:
+                    continue
+                grad_np = grad.numpy()
+                if grad_np.ndim == 3:
+                    unit_grad = np.sqrt(np.sum(grad_np[0] ** 2, axis=0))
+                elif grad_np.ndim == 2:
+                    unit_grad = np.abs(grad_np[0])
+                else:
+                    unit_grad = np.abs(grad_np.ravel())
+                fisher[key] += unit_grad ** 2
+            count += 1
+
+    if count == 0:
+        return fisher
+    for name in fisher:
+        fisher[name] /= (count + 1e-9)
+    return fisher
+
+# -----------------------------
+# Visualization helpers
+# -----------------------------
+def visualize_specialists(model, dataset, log_dir, max_points=2000):
+    md_layers = get_masked_dense_layers(model)
+    acts = capture_activations(model, dataset, masked_layers=md_layers)
+    for name, a in acts.items():
+        if a.size == 0:
+            continue
+        if a.shape[0] > max_points:
+            idx = np.random.choice(a.shape[0], max_points, replace=False)
+            a_sub = a[idx]
+        else:
+            a_sub = a
+        try:
+            pca = PCA(n_components=2)
+            comp = pca.fit_transform(a_sub.T)
+        except Exception:
+            continue
+        plt.figure(figsize=(6, 6))
+        plt.scatter(comp[:, 0], comp[:, 1], s=6)
+        plt.title(f'PCA neuron embedding - {name}')
+        plt.xlabel('PC1'); plt.ylabel('PC2')
+        plt.grid(True)
+        plt.savefig(os.path.join(log_dir, f'pca_neurons_{name}.png'))
+        plt.close()
+
+# -----------------------------
+# EvoCompressor (adaptive pruning + pareto logging)
+# -----------------------------
 class EvoCompressor:
-    def __init__(self, model, val_ds, base_prune=0.2, regrow_fraction=0.2, log_dir=None, tb_writer=None):
+    def __init__(self, model, val_ds, base_prune=0.2, regrow_fraction=0.2, log_dir=None):
         self.model = model
         self.val_ds = val_ds
         self.base_prune = base_prune
         self.regrow_fraction = regrow_fraction
         self.log_dir = log_dir
-        self.tb_writer = tb_writer
         self.history = []
-        self.best_efficiency = np.inf
+        self.pareto = []
 
-    def _alive_counts(self):
-        md_layers = get_masked_dense_layers(self.model)
-        return sum(int(l.mask.numpy().sum()) for l in md_layers)
-
-    def evaluate_and_compress(self, train_loss=None, val_loss=None, step=None):
+    def evaluate_and_compress(self, train_loss=None, val_loss=None):
+        # print('\nNow running evaluate_and_compress method...\n')
         md_layers = get_masked_dense_layers(self.model)
         acts = capture_activations(self.model, self.val_ds, masked_layers=md_layers)
         entropies = {name: compute_activation_entropy(a) for name, a in acts.items()}
-        fisher = approx_fisher_per_sample(self.model, self.val_ds, keras.losses.MeanSquaredError(), max_samples_per_batch=CONFIG['max_fisher_samples_per_batch'])
+        fisher = approx_fisher_per_sample(self.model, self.val_ds, keras.losses.Huber(), max_samples_per_batch=CONFIG['max_fisher_samples_per_batch'])
         utilities = {}
         for name in entropies:
             e = entropies[name]
@@ -460,59 +606,64 @@ class EvoCompressor:
                 continue
             e_norm = (e - np.median(e)) / (np.std(e) + 1e-9)
             f_norm = (f - np.median(f)) / (np.std(f) + 1e-9)
-            utilities[name] = 0.5 * e_norm + 0.5 * f_norm
+            score = 0.5 * e_norm + 0.5 * f_norm
+            utilities[name] = score
 
-        total_params = np.sum([np.prod(w.shape) for w in self.model.trainable_weights])
-        alive_total = self._alive_counts()
-        alive_ratio = alive_total / float(total_params + 1e-9)
-
-        val_metrics = self.model.evaluate(self.val_ds, verbose=0)
-        val_loss_now = float(val_metrics[0])
-        efficiency_now = val_loss_now * (1.0 + alive_ratio)
-
-        apply_prune = False
         prune_fraction = self.base_prune
-        if efficiency_now < self.best_efficiency:
-            apply_prune = True
-            self.best_efficiency = efficiency_now
-        else:
-            prune_fraction *= 0.5
+        if train_loss is not None and val_loss is not None:
+            gap = float(val_loss - train_loss)
+            rel = gap / (abs(val_loss) + 1e-9)
+            prune_fraction = float(self.base_prune * (1.0 + rel))
+            prune_fraction = np.clip(prune_fraction, 0.02, 0.6)
 
-        for name, score in utilities.items():
-            layer = next((l for l in md_layers if l.name == name), None)
+        total_alive = 0
+        for unique_name, score in utilities.items():
+            layer = None
+            for l in md_layers:
+                if f"{l.name}_{hex(id(l))}" == unique_name:
+                    layer = l
+                    break
             if layer is None:
+                print(f'No matching layer object for {unique_name} — skipping')
                 continue
             mask = layer.mask.numpy()
+            print(f'\nLayer {unique_name} mask (alive count):', int(mask.sum()))
             alive_idx = np.where(mask > 0.5)[0]
+            total_alive += len(alive_idx)
             if len(alive_idx) == 0:
                 continue
             scores_alive = score[alive_idx]
             n_prune = max(1, int(len(alive_idx) * prune_fraction))
             prune_pos = np.argsort(scores_alive)[:n_prune]
             prune_idx = alive_idx[prune_pos]
-            if apply_prune:
-                layer.prune_units(prune_idx)
-            n_regrow = int(n_prune * self.regrow_fraction)
+            layer.prune_units(prune_idx)
+            
+            # deterministic rounding, ensure at least 1 regrow when regrow_fraction positive
+            if self.regrow_fraction > 0:
+                n_regrow = max(1, int(round(n_prune * self.regrow_fraction)))
+            else:
+                n_regrow = 0
+            
             if n_regrow > 0:
-                regrow_idx = np.random.choice(prune_idx, size=n_regrow, replace=False)
+                # choose indices to regrow from those just pruned (can be change to dead pool if preferred)
+                regrow_idx = np.random.choice(prune_idx, size=min(n_regrow, len(prune_idx)), replace=False)
                 layer.regrow_units(regrow_idx)
+                print(f"[DEBUG] {layer.name}: pruned {len(prune_idx)} -> regrew {len(regrow_idx)}")
 
-        if self.tb_writer is not None:
-            with self.tb_writer.as_default():
-                tf.summary.scalar('compressor/val_loss', val_loss_now, step=step)
-                tf.summary.scalar('compressor/alive_total', alive_total, step=step)
-                tf.summary.scalar('compressor/efficiency', efficiency_now, step=step)
 
-        summary = {
-            'alive_total': int(self._alive_counts()),
-            'prune_fraction_used': float(prune_fraction),
-            'val_loss': val_loss_now,
-            'efficiency': float(efficiency_now),
-            'applied_prune': bool(apply_prune)
-        }
+        # val_metrics = self.model.evaluate(self.val_ds if not isinstance(self.val_ds, tuple) else (self.val_ds[0], self.val_ds[1]), verbose=0)
+        if isinstance(self.val_ds, tuple) and isinstance(self.val_ds[0], np.ndarray):
+            val_metrics = self.model.evaluate(self.val_ds[0], self.val_ds[1], verbose=0)
+        else:
+            val_metrics = self.model.evaluate(self.val_ds, verbose=0)
+        
+        val_loss_now = float(val_metrics[0])
+        self.pareto.append((total_alive, val_loss_now))
+
+        summary = {'alive_total': int(total_alive), 'prune_fraction_used': float(prune_fraction), 'val_loss': val_loss_now}
         self.history.append(summary)
         df_rows = []
-        for name, layer in [(n, next((l for l in md_layers if l.name == n), None)) for n in utilities.keys()]:
+        for name, layer in [(n, next((l for l in md_layers if f"{l.name}_{hex(id(l))}" == n), None)) for n in utilities.keys()]:
             if layer is None:
                 continue
             df_rows.append({'layer': name, 'alive': int(layer.mask.numpy().sum()), 'utility_mean': float(utilities[name].mean())})
@@ -521,56 +672,51 @@ class EvoCompressor:
         return summary
 
 # -----------------------------
-# Training + cycles (integrate everything)
-# (integrate everything)
+# Training + cycles
 # -----------------------------
-
 def run_experiment(model, train_ds, val_ds, config):
-    """Main training loop that wires up callbacks correctly.
-
-    Fixes:
-    - Builds router_infos via get_router_info(model) so we can both anneal and log routers.
-    - Passes the correct 'routers' list to AnnealCallback (previously passed the model erroneously).
-    - Passes router_infos (with pooled_submodels) to RouterLoggingCallback so it can compute true pooled contexts.
-    """
     log_dir = config['log_dir']
-    tb_cb = keras.callbacks.TensorBoard(log_dir=log_dir)
-    chkpt_path = os.path.join(log_dir, 'best_model.keras')
-    chkpt = keras.callbacks.ModelCheckpoint(chkpt_path, save_best_only=True, monitor='val_loss')
+    chkpt_path = os.path.join(log_dir, 'best_base_model.keras')
+    
+    callbacks = [keras.callbacks.TensorBoard(log_dir=log_dir),
+                 keras.callbacks.ModelCheckpoint(chkpt_path, save_best_only=True, monitor='val_loss'),
+                 keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1),
+                 keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.9, patience=3, cooldown=0),
+                ]
 
-    # TensorBoard writer for custom scalars
-    tb_writer = tf.summary.create_file_writer(log_dir + '/custom')
+    print('\nWarmup training...\n')
+    history = model.fit(train_ds[0], train_ds[1], batch_size=config['batch_size'],
+                        validation_data=(val_ds[0], val_ds[1]), epochs=config['epochs_per_phase'],
+                        callbacks=callbacks, verbose=2)
 
-    # Discover routers and their pooled context submodels
-    router_infos = get_router_info(model)
-    routers = [info['router'] for info in router_infos if info.get('router') is not None]
-
-    anneal_cb = AnnealCallback(routers, config['anneal_start_temp'], config['anneal_end_temp'], config['anneal_epochs_total'])
-    router_log_cb = RouterLoggingCallback(router_infos, val_ds, tb_writer)
-
-    compressor = EvoCompressor(model, val_ds, base_prune=config['prune_fraction'], regrow_fraction=config['regrow_fraction'], log_dir=log_dir, tb_writer=tb_writer)
-
-    print('Warmup training...')
-    history = model.fit(train_ds, validation_data=val_ds, epochs=config['epochs_per_phase'], callbacks=[tb_cb, chkpt, anneal_cb, router_log_cb], verbose=2)
-
-    global_step = 0
     for cycle in range(config['cycles']):
-        print(f'--- Cycle {cycle+1}/{config["cycles"]} ---')
+        compressor = EvoCompressor(model, val_ds, base_prune=config['prune_fraction'], regrow_fraction=config['regrow_fraction'], log_dir=log_dir)
+        print(f'\n--- Cycle {cycle + 1}/{config["cycles"]} ---\n')
+
+        chkpt_path = os.path.join(log_dir, f'best_cycle_{cycle+1}_model.keras')
+        callbacks = [keras.callbacks.TensorBoard(log_dir=log_dir),
+                     keras.callbacks.ModelCheckpoint(chkpt_path, save_best_only=True, monitor='val_loss'),
+                     keras.callbacks.EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True, verbose=1),
+                     keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.9, patience=6, cooldown=0),
+                    ]
+        
+        history = model.fit(train_ds[0], train_ds[1], batch_size=config['batch_size'],
+                            validation_data=(val_ds[0], val_ds[1]), epochs=config['epochs_per_phase'],
+                            callbacks=callbacks, verbose=2)
+
         train_loss = float(history.history['loss'][-1])
         val_loss = float(history.history['val_loss'][-1])
-        summary = compressor.evaluate_and_compress(train_loss=train_loss, val_loss=val_loss, step=global_step)
-        print('Compressor summary:', summary)
-        visualize_specialists(model, val_ds, log_dir)
-        history = model.fit(train_ds, validation_data=val_ds, epochs=config['epochs_per_phase'], callbacks=[tb_cb, chkpt, anneal_cb, router_log_cb], verbose=2)
-        global_step += 1
+        summary = compressor.evaluate_and_compress(train_loss=train_loss, val_loss=val_loss)
+        print('\nCompressor summary:', summary,'\n')
+        visualize_specialists(model, val_ds, log_dir)        
 
     model.save(os.path.join(log_dir, 'final_model.keras'))
     return model, compressor
 
 if __name__ == '__main__':
     trained_model, compressor = run_experiment(model, train_ds, val_ds, CONFIG)
-    print('Final alive neuron counts per masked layer:')
+    print('\nFinal alive neuron counts per masked layer:')
     md_layers = get_masked_dense_layers(trained_model)
     for l in md_layers:
-        print(l.name, int(l.mask.numpy().sum()), '/', l.units)
+        print(f"{l.name}_{hex(id(l))}", int(l.mask.numpy().sum()), '/', l.units)
     print('Logs and snapshots saved to', CONFIG['log_dir'])
