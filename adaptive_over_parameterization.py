@@ -20,6 +20,7 @@ import pandas as pd
 import datetime
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
+from collections import defaultdict
 
 # -----------------------------
 # Config / seeds
@@ -42,7 +43,7 @@ def make_dataset(data, n, seq_len):
     return X, Y
 
 def compute_batch_size(dataset_length: int) -> int:
-    base_unit = 24_576
+    base_unit = 16_384
     base_batch = 32
     scale = math.ceil(max(1, dataset_length) / base_unit)
     return int(base_batch * scale)
@@ -56,13 +57,13 @@ def numpy_batch_iter(X, Y, batch_size):
 # Load data
 # -----------------------------
 raw_df = pd.read_csv('datasets/EURUSD_M1_245.csv')
-df = raw_df.tail(10_000).copy()
+df = raw_df.tail(16_384).copy()
 df = df[df['High'] != df['Low']]
 df.dropna(inplace=True)
 df.reset_index(inplace=True, drop=True)
 data = df[['Close']].values
 
-split = 1000
+split = 1024
 train_data = data[:-split]
 val_data = data[-split:]
 
@@ -73,15 +74,15 @@ CONFIG = {
     'train_size': len(train_data),
     'val_size': len(val_data),
     'batch_size': batch_size,
-    'epochs_per_phase': 5,
-    'cycles': 8,
-    'prune_fraction': 0.30,
-    'regrow_fraction': 0.30,
+    'epochs_per_phase': 10,
+    'cycles': 12,
+    'prune_fraction': 0.3,
+    'regrow_fraction': 0.3,
+    'connection_rewire_fraction': 0.1,
     'd_model': 32,
     'hidden_units': 128,
     'hidden_layers': 2,
     'num_heads': 2,
-    # 'ffn_mult': 4,
     'learning_rate': 1e-3,
     'max_fisher_samples_per_batch': 8,
     'log_dir': './logs/adaptive_overparam_' + datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -91,6 +92,10 @@ os.makedirs(CONFIG['log_dir'], exist_ok=True)
 
 X_train, Y_train = make_dataset(train_data, CONFIG['train_size'], CONFIG['seq_len'])
 X_val, Y_val = make_dataset(val_data, CONFIG['val_size'], CONFIG['seq_len'])
+
+# Create built-in normalization layer for the model
+norm = keras.layers.Normalization()
+norm.adapt(X_train)
 
 # Use NumPy tuples instead of tf.data pipelines to avoid exhaustion issues while prototyping
 train_ds = (X_train, Y_train)
@@ -137,25 +142,35 @@ class MaskedDense(keras.layers.Layer):
             initializer='zeros',
             trainable=True
         )
+        # neuron-level mask
         self.mask = self.add_weight(
             name='mask',
             shape=(self.units,),
-            initializer=keras.initializers.Constant(1.0),
+            initializer='ones',
             trainable=False
         )
+        # connection-level mask (same shape as kernel)
+        self.conn_mask = self.add_weight(
+            name='conn_mask',
+            shape=(last_dim, self.units),
+            initializer='ones',
+            trainable=False
+        )
+        self.conn_age = self.add_weight(
+            name='conn_age',
+            shape=(last_dim, self.units),
+            initializer='zeros',
+            trainable=False
+        )        
 
     def call(self, inputs, return_pre_activation=False):
-        masked_kernel = self.kernel * tf.reshape(self.mask, (1, -1))
+        masked_kernel = self.kernel * self.conn_mask * tf.reshape(self.mask, (1, -1))
         masked_bias = self.bias * self.mask
         pre = tf.matmul(inputs, masked_kernel) + masked_bias
-        if self.activation is not None:
-            out = self.activation(pre)
-        else:
-            out = pre
-        if return_pre_activation:
-            return pre, out
-        return out
+        out = self.activation(pre) if self.activation is not None else pre
+        return (pre, out) if return_pre_activation else out
 
+    # neuron-level operations
     def prune_units(self, indices):
         m = self.mask.numpy()
         m[indices] = 0.0
@@ -173,8 +188,29 @@ class MaskedDense(keras.layers.Layer):
         self.kernel.assign(k)
         self.bias.assign(b)
 
+    # connection-level operations
+    def prune_connections(self, idx_pairs):
+        if len(idx_pairs) == 0:
+            return
+        m = self.conn_mask.numpy()
+        for (i, j) in idx_pairs:
+            m[i, j] = 0.0
+        self.conn_mask.assign(m)
+
+    def regrow_connections(self, idx_pairs):
+        if len(idx_pairs) == 0:
+            return
+        m = self.conn_mask.numpy()
+        k = self.kernel.numpy()
+        for (i, j) in idx_pairs:
+            m[i, j] = 1.0
+            k[i, j] = np.random.normal(scale=0.02)
+        self.conn_mask.assign(m)
+        self.kernel.assign(k)
+
     def get_config(self):
         return {'units': self.units, 'activation': keras.activations.serialize(self.activation)}
+
 
 # -----------------------------
 # Router (Concrete)
@@ -258,7 +294,8 @@ class TransformerBlock(keras.layers.Layer):
 
 def build_transformer_model(seq_len, d_model, num_layers, num_heads, ff_dim):
     inp = keras.layers.Input(shape=(seq_len, 1))
-    x = keras.layers.TimeDistributed(keras.layers.Dense(d_model))(inp)
+    x = norm(inp)
+    x = keras.layers.Dense(d_model)(x)
     pe = positional_encoding(seq_len, d_model)
     x = x + pe
     for i in range(num_layers):
@@ -583,21 +620,39 @@ def visualize_specialists(model, dataset, log_dir, max_points=2000):
 # EvoCompressor (adaptive pruning + pareto logging)
 # -----------------------------
 class EvoCompressor:
-    def __init__(self, model, val_ds, base_prune=0.2, regrow_fraction=0.2, log_dir=None):
+    def __init__(self, model, val_ds, base_prune=0.2, regrow_fraction=0.2,
+                 connection_rewire_fraction=0.03, log_dir=None, regrow_loss_tol=0.01):
+        """
+        regrow_loss_tol: relative tolerance (e.g. 0.01 -> 1%). If pruned_val_loss > baseline*(1+tol) then trigger regrowth.
+        """
         self.model = model
         self.val_ds = val_ds
         self.base_prune = base_prune
         self.regrow_fraction = regrow_fraction
+        self.connection_rewire_fraction = connection_rewire_fraction
         self.log_dir = log_dir
         self.history = []
         self.pareto = []
+        self.conn_age_log = defaultdict(list)
+        self.regrow_loss_tol = float(regrow_loss_tol)
 
-    def evaluate_and_compress(self, train_loss=None, val_loss=None):
-        # print('\nNow running evaluate_and_compress method...\n')
+    def evaluate_and_compress(self, train_loss=None, val_loss=None, do_regrow=True):
+        """
+        Two-phase compress:
+          1) prune-only pass (neurons + connection pruning) -> evaluate pruned network
+          2) if pruned loss worsened beyond regrow_loss_tol relative to baseline, perform regrowth (neurons + connections)
+             and re-evaluate.
+        Returns summary corresponding to final network state (after regrow if triggered).
+        """
         md_layers = get_masked_dense_layers(self.model)
+        # compute utilities (entropy + fisher)
         acts = capture_activations(self.model, self.val_ds, masked_layers=md_layers)
         entropies = {name: compute_activation_entropy(a) for name, a in acts.items()}
-        fisher = approx_fisher_per_sample(self.model, self.val_ds, keras.losses.Huber(), max_samples_per_batch=CONFIG['max_fisher_samples_per_batch'])
+        fisher = approx_fisher_per_sample(
+            self.model, self.val_ds, keras.losses.Huber(),
+            max_samples_per_batch=CONFIG['max_fisher_samples_per_batch']
+        )
+
         utilities = {}
         for name in entropies:
             e = entropies[name]
@@ -606,9 +661,9 @@ class EvoCompressor:
                 continue
             e_norm = (e - np.median(e)) / (np.std(e) + 1e-9)
             f_norm = (f - np.median(f)) / (np.std(f) + 1e-9)
-            score = 0.5 * e_norm + 0.5 * f_norm
-            utilities[name] = score
+            utilities[name] = 0.5 * e_norm + 0.5 * f_norm
 
+        # dynamic prune fraction based on gap
         prune_fraction = self.base_prune
         if train_loss is not None and val_loss is not None:
             gap = float(val_loss - train_loss)
@@ -616,60 +671,273 @@ class EvoCompressor:
             prune_fraction = float(self.base_prune * (1.0 + rel))
             prune_fraction = np.clip(prune_fraction, 0.02, 0.6)
 
-        total_alive = 0
+        # Baseline val loss to compare against (use provided val_loss if available)
+        if val_loss is not None:
+            baseline_val_loss = float(val_loss)
+        else:
+            # evaluate baseline now
+            if isinstance(self.val_ds, tuple) and isinstance(self.val_ds[0], np.ndarray):
+                baseline_val_loss = float(self.model.evaluate(self.val_ds[0], self.val_ds[1], verbose=0)[0])
+            else:
+                baseline_val_loss = float(self.model.evaluate(self.val_ds, verbose=0)[0])
+
+        # ---- Phase A: prune-only pass ----
+        # We will store pruning decisions so we can regrow later if necessary.
+        stored_prune_info = {}  # keyed by unique_name -> dict with 'prune_idx', 'n_prune', 'conn_low_pairs', 'n_rewire'
+        total_alive_pre = 0
+
+        # First, increment age for current alive connections (before pruning)
+        for layer in md_layers:
+            conn_mask = layer.conn_mask.numpy()
+            conn_age = layer.conn_age.numpy()
+            conn_age[conn_mask > 0.5] += 1.0
+            layer.conn_age.assign(conn_age)
+
+        # Now perform prune-only operations across layers
         for unique_name, score in utilities.items():
-            layer = None
-            for l in md_layers:
-                if f"{l.name}_{hex(id(l))}" == unique_name:
-                    layer = l
-                    break
+            layer = next((l for l in md_layers if f"{l.name}_{hex(id(l))}" == unique_name), None)
             if layer is None:
                 print(f'No matching layer object for {unique_name} — skipping')
                 continue
+
             mask = layer.mask.numpy()
-            print(f'\nLayer {unique_name} mask (alive count):', int(mask.sum()))
+            conn_mask = layer.conn_mask.numpy()
+            print(f'\n[PRUNE-PHASE] Layer {unique_name}: alive neurons={int(mask.sum())}, alive_conns={int(conn_mask.sum())}')
+
             alive_idx = np.where(mask > 0.5)[0]
-            total_alive += len(alive_idx)
-            if len(alive_idx) == 0:
-                continue
-            scores_alive = score[alive_idx]
-            n_prune = max(1, int(len(alive_idx) * prune_fraction))
-            prune_pos = np.argsort(scores_alive)[:n_prune]
-            prune_idx = alive_idx[prune_pos]
-            layer.prune_units(prune_idx)
-            
-            # deterministic rounding, ensure at least 1 regrow when regrow_fraction positive
-            if self.regrow_fraction > 0:
-                n_regrow = max(1, int(round(n_prune * self.regrow_fraction)))
-            else:
-                n_regrow = 0
-            
-            if n_regrow > 0:
-                # choose indices to regrow from those just pruned (can be change to dead pool if preferred)
-                regrow_idx = np.random.choice(prune_idx, size=min(n_regrow, len(prune_idx)), replace=False)
-                layer.regrow_units(regrow_idx)
-                print(f"[DEBUG] {layer.name}: pruned {len(prune_idx)} -> regrew {len(regrow_idx)}")
+            total_alive_pre += len(alive_idx)
 
+            # ---- neuron-level prune/regrow ----
+            prune_idx = np.zeros((0,), dtype=int)
+            n_prune = 0
+            if len(alive_idx) > 0:
+                scores_alive = score[alive_idx]
+                n_prune = max(1, int(len(alive_idx) * prune_fraction))
+                prune_pos = np.argsort(scores_alive)[:n_prune]
+                prune_idx = alive_idx[prune_pos]
+                layer.prune_units(prune_idx)
+                print(f"[PRUNE-PHASE] {layer.name}: pruned {len(prune_idx)} neurons")
 
-        # val_metrics = self.model.evaluate(self.val_ds if not isinstance(self.val_ds, tuple) else (self.val_ds[0], self.val_ds[1]), verbose=0)
+            #  ---- connection-level pruning (age-weighted score) ----
+            W = layer.kernel.numpy()
+            conn_mask = layer.conn_mask.numpy()
+            conn_age = layer.conn_age.numpy()
+            absW = np.abs(W) * (conn_mask > 0.5)
+            age_penalty = np.tanh(conn_age / (np.max(conn_age) + 1e-6))
+            score_matrix = absW * (1.0 - 0.5 * age_penalty)
+            flat_score = score_matrix.flatten()
+            n_rewire = int(flat_score.size * self.connection_rewire_fraction)
+
+            low_pairs = np.zeros((0, 2), dtype=int)
+            if n_rewire > 0:
+                # prune the weakest (by score) alive connections
+                nonzero_count = np.count_nonzero(flat_score)
+                k_prune = min(n_rewire, nonzero_count)
+                if k_prune > 0:
+                    low_idx = np.argpartition(flat_score, k_prune)[:k_prune]
+                    low_pairs = np.array(np.unravel_index(low_idx, conn_mask.shape)).T
+                    layer.prune_connections(low_pairs)
+                    print(f"[PRUNE-PHASE] {layer.name}: pruned {len(low_pairs)} connections (weak+old)")
+
+            stored_prune_info[unique_name] = {
+                'prune_idx': prune_idx,
+                'n_prune': int(n_prune),
+                'conn_low_pairs': low_pairs,
+                'n_rewire': int(n_rewire)
+            }
+
+        # Evaluate pruned network
         if isinstance(self.val_ds, tuple) and isinstance(self.val_ds[0], np.ndarray):
-            val_metrics = self.model.evaluate(self.val_ds[0], self.val_ds[1], verbose=0)
+            val_metrics_pruned = self.model.evaluate(self.val_ds[0], self.val_ds[1], verbose=0)
         else:
-            val_metrics = self.model.evaluate(self.val_ds, verbose=0)
-        
-        val_loss_now = float(val_metrics[0])
-        self.pareto.append((total_alive, val_loss_now))
+            val_metrics_pruned = self.model.evaluate(self.val_ds, verbose=0)
+        pruned_val_loss = float(val_metrics_pruned[0])
+        print(f"\n[PRUNE-PHASE] baseline_val_loss={baseline_val_loss:.9f}, pruned_val_loss={pruned_val_loss:.9f}")
 
-        summary = {'alive_total': int(total_alive), 'prune_fraction_used': float(prune_fraction), 'val_loss': val_loss_now}
-        self.history.append(summary)
+        regrow_triggered = False
+        val_loss_after_regrow = pruned_val_loss
+
+        # Decision: trigger regrowth only if pruning degraded validation beyond tolerance AND regrow enabled
+        if do_regrow and (pruned_val_loss > baseline_val_loss * (1.0 + self.regrow_loss_tol)):
+            print(f"[REGROW-DECISION] Pruned loss worsened beyond tol ({self.regrow_loss_tol*100:.2f}%), triggering regrowth.")
+            regrow_triggered = True
+
+            # ---- Phase B: perform regrowth guided by utilities/desirability ----
+            for unique_name, info in stored_prune_info.items():
+                layer = next((l for l in md_layers if f"{l.name}_{hex(id(l))}" == unique_name), None)
+                if layer is None:
+                    continue
+
+                # neuron regrowth: n_regrow ~ Binomial(n_prune, regrow_fraction)
+                n_prune = info['n_prune']
+                if n_prune <= 0 or self.regrow_fraction <= 0:
+                    n_regrow = 0
+                else:
+                    n_regrow = int(np.random.binomial(n_prune, self.regrow_fraction))
+
+                if n_regrow > 0:
+                    dead_indices = np.where(layer.mask.numpy() == 0)[0]
+                    if len(dead_indices) >= n_regrow:
+                        regrow_idx = np.random.choice(dead_indices, size=n_regrow, replace=False)
+                    else:
+                        # fall back to regrowing from the previously pruned indices if not enough other dead ones
+                        available = info['prune_idx'] if info['prune_idx'].size else dead_indices
+                        regrow_idx = np.random.choice(available, size=min(n_regrow, len(available)), replace=False)
+                    layer.regrow_units(regrow_idx)
+                    print(f"[REGROW] {layer.name}: regrew {len(regrow_idx)} neurons")
+
+                # connection regrowth: use desirability heuristic (out_u + in_u)
+                regrew_conn_count = 0
+                n_rewire = info['n_rewire']
+                if n_rewire > 0:
+                    W = layer.kernel.numpy()
+                    out_util = utilities.get(unique_name, np.zeros((layer.units,)))
+                    if out_util.size == layer.units:
+                        out_u = out_util.copy().astype(np.float32)
+                        out_u = (out_u - out_u.min()) / (out_u.max() - out_u.min() + 1e-9)
+                    else:
+                        out_u = np.ones((layer.units,), dtype=np.float32)
+
+                    in_u = np.mean(np.abs(W), axis=1) if W.size else np.zeros((W.shape[0],))
+                    if in_u.size:
+                        in_u = (in_u - in_u.min()) / (in_u.max() - in_u.min() + 1e-9)
+                    else:
+                        in_u = np.zeros_like(in_u)
+
+                    dead_pairs = np.argwhere(layer.conn_mask.numpy() < 0.5)
+                    if dead_pairs.size > 0:
+                        alpha_out = 0.6
+                        beta_in = 0.4
+                        di = dead_pairs[:, 0]; dj = dead_pairs[:, 1]
+                        desirability = (alpha_out * out_u[dj]) + (beta_in * in_u[di])
+                        desirability += np.random.rand(len(desirability)) * 1e-6
+                        k = min(n_rewire, len(dead_pairs))
+                        if k > 0:
+                            choose_idx = np.argpartition(-desirability, k - 1)[:k]
+                            regrow_pairs = dead_pairs[choose_idx]
+                            layer.regrow_connections(regrow_pairs)
+                            # reset ages for regrown connections
+                            conn_age = layer.conn_age.numpy()
+                            for (i, j) in regrow_pairs:
+                                conn_age[i, j] = 0.0
+                            layer.conn_age.assign(conn_age)
+                            regrew_conn_count = len(regrow_pairs)
+                            print(f"[REGROW] {layer.name}: regrew {regrew_conn_count} connections")
+
+            # Evaluate after regrowth
+            if isinstance(self.val_ds, tuple) and isinstance(self.val_ds[0], np.ndarray):
+                val_metrics_after = self.model.evaluate(self.val_ds[0], self.val_ds[1], verbose=0)
+            else:
+                val_metrics_after = self.model.evaluate(self.val_ds, verbose=0)
+            val_loss_after_regrow = float(val_metrics_after[0])
+            print(f"[REGROW-PHASE] val_loss_after_regrow={val_loss_after_regrow:.6f}")
+
+        # Finalize: compute summaries after final state
+        md_layers_final = get_masked_dense_layers(self.model)
+        total_alive = 0
         df_rows = []
-        for name, layer in [(n, next((l for l in md_layers if f"{l.name}_{hex(id(l))}" == n), None)) for n in utilities.keys()]:
-            if layer is None:
-                continue
-            df_rows.append({'layer': name, 'alive': int(layer.mask.numpy().sum()), 'utility_mean': float(utilities[name].mean())})
+        for layer in md_layers_final:
+            mask = layer.mask.numpy()
+            conn_mask = layer.conn_mask.numpy()
+
+            # log age stats for this final state
+            conn_age = layer.conn_age.numpy()
+            alive_ages = conn_age[conn_mask > 0.5]
+            if alive_ages.size > 0:
+                self.conn_age_log[layer.name].append({
+                    'mean': float(np.mean(alive_ages)),
+                    'std': float(np.std(alive_ages)),
+                    'max': float(np.max(alive_ages)),
+                    'alive_count': int(np.sum(conn_mask > 0.5))
+                })
+
+            total_alive += int(mask.sum())
+            conn_alive = int(conn_mask.sum())
+            conn_density = conn_alive / float(np.prod(conn_mask.shape))
+            alive_neurons = int(mask.sum())
+            alive_weights = layer.kernel.numpy()[conn_mask > 0.5]
+            avg_conn_mag = float(np.mean(np.abs(alive_weights))) if alive_weights.size else 0.0
+
+            unique_name = f"{layer.name}_{hex(id(layer))}"
+            df_rows.append({
+                'layer': unique_name,
+                'alive_neurons': alive_neurons,
+                'alive_connections': conn_alive,
+                'conn_density': conn_density,
+                'utility_mean': float(utilities.get(unique_name, np.zeros((layer.units,))).mean()) if unique_name in utilities else 0.0,
+                'avg_conn_mag': avg_conn_mag
+            })
+
+        # evaluate model and finalize final loss
+        if isinstance(self.val_ds, tuple) and isinstance(self.val_ds[0], np.ndarray):
+            val_metrics_final = self.model.evaluate(self.val_ds[0], self.val_ds[1], verbose=0)
+        else:
+            val_metrics_final = self.model.evaluate(self.val_ds, verbose=0)
+        val_loss_now = float(val_metrics_final[0])
+
+        self.pareto.append((total_alive, val_loss_now))
+        summary = {
+            'alive_total': int(total_alive),
+            'prune_fraction_used': float(prune_fraction),
+            'baseline_val_loss': baseline_val_loss,
+            'pruned_val_loss': pruned_val_loss,
+            'regrow_triggered': bool(regrow_triggered),
+            'val_loss_after_regrow': float(val_loss_after_regrow),
+            'val_loss_final': val_loss_now
+        }
+        self.history.append(summary)
+
+        # write CSV snapshot
         df = pd.DataFrame(df_rows)
-        df.to_csv(os.path.join(self.log_dir, f'compressor_snapshot_{len(self.history)}.csv'), index=False)
+        if self.log_dir:
+            os.makedirs(self.log_dir, exist_ok=True)
+            df.to_csv(os.path.join(self.log_dir, f'compressor_snapshot_{len(self.history)}.csv'), index=False)
+
+        # print conn_age summary
+        for lname, stats in self.conn_age_log.items():
+            last = stats[-1]
+            print(f"[AGE MONITOR] {lname}: mean={last['mean']:.2f}, std={last['std']:.2f}, max={last['max']:.0f}, alive={last['alive_count']}")
+
         return summary
+
+    def plot_conn_age_history(self):
+        if not self.conn_age_log:
+            print("No connection age history to plot.")
+            return
+        os.makedirs(self.log_dir, exist_ok=True)
+        for lname, logs in self.conn_age_log.items():
+            steps = np.arange(len(logs))
+            means = [x['mean'] for x in logs]
+            stds = [x['std'] for x in logs]
+            plt.figure(figsize=(7, 4))
+            plt.fill_between(steps, np.array(means)-np.array(stds), np.array(means)+np.array(stds), alpha=0.3)
+            plt.plot(steps, means, label=f'{lname} mean±std')
+            plt.xlabel('Compression cycle')
+            plt.ylabel('Connection age')
+            plt.title(f'Connection age evolution - {lname}')
+            plt.legend()
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.log_dir, f'conn_age_{lname}.png'))
+            plt.close()
+
+    def visualize_conn_age_heatmaps(self):
+        md_layers = get_masked_dense_layers(self.model)
+        os.makedirs(self.log_dir, exist_ok=True)
+        for layer in md_layers:
+            conn_age = layer.conn_age.numpy()
+            conn_mask = layer.conn_mask.numpy()
+            conn_age_masked = conn_age * conn_mask
+            plt.figure(figsize=(6, 5))
+            plt.imshow(conn_age_masked, aspect='auto', cmap='viridis')
+            plt.colorbar(label='Connection Age')
+            plt.title(f'{layer.name} Connection Ages')
+            plt.xlabel('Output Neuron')
+            plt.ylabel('Input Feature')
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.log_dir, f'conn_age_heatmap_{layer.name}.png'))
+            plt.close()
+
 
 # -----------------------------
 # Training + cycles
@@ -680,8 +948,8 @@ def run_experiment(model, train_ds, val_ds, config):
     
     callbacks = [keras.callbacks.TensorBoard(log_dir=log_dir),
                  keras.callbacks.ModelCheckpoint(chkpt_path, save_best_only=True, monitor='val_loss'),
-                 keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1),
-                 keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.9, patience=3, cooldown=0),
+                 keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
+                 keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.9, patience=5, cooldown=10),
                 ]
 
     print('\nWarmup training...\n')
@@ -690,14 +958,18 @@ def run_experiment(model, train_ds, val_ds, config):
                         callbacks=callbacks, verbose=2)
 
     for cycle in range(config['cycles']):
-        compressor = EvoCompressor(model, val_ds, base_prune=config['prune_fraction'], regrow_fraction=config['regrow_fraction'], log_dir=log_dir)
+        compressor = EvoCompressor(model, val_ds, base_prune=config['prune_fraction'],
+                                   regrow_fraction=config['regrow_fraction'],
+                                   connection_rewire_fraction=config['connection_rewire_fraction'],
+                                   log_dir=log_dir
+                                  )
         print(f'\n--- Cycle {cycle + 1}/{config["cycles"]} ---\n')
 
         chkpt_path = os.path.join(log_dir, f'best_cycle_{cycle+1}_model.keras')
         callbacks = [keras.callbacks.TensorBoard(log_dir=log_dir),
                      keras.callbacks.ModelCheckpoint(chkpt_path, save_best_only=True, monitor='val_loss'),
-                     keras.callbacks.EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True, verbose=1),
-                     keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.9, patience=6, cooldown=0),
+                     keras.callbacks.EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1),
+                     keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.9, patience=5, cooldown=2),
                     ]
         
         history = model.fit(train_ds[0], train_ds[1], batch_size=config['batch_size'],
