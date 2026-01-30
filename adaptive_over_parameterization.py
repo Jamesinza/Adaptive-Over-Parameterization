@@ -61,7 +61,7 @@ def numpy_batch_iter(X, Y, batch_size):
 # Load data
 # -----------------------------
 raw_df = pd.read_csv('datasets/EURUSD_M1_245.csv')
-df = raw_df.tail(100_000).copy()
+df = raw_df.tail(10_000).copy()
 df = df[df['High'] != df['Low']]
 df.dropna(inplace=True)
 df.reset_index(inplace=True, drop=True)
@@ -75,12 +75,13 @@ CONFIG = {
     'train_size': len(train_data),
     'val_size': len(val_data),
     'batch_size': batch_size,
-    'epochs_per_phase': 1,
+    'warm_up_epochs': 1,
+    'epochs_per_phase': 100,
     'cycles': 100,
     'regrow_finetune_steps': 3,
     'mask_thresh_min': 0.1,
     'mask_thresh_multi': 0.05,
-    'prune_fraction': 0.1,
+    'prune_fraction': 0.4,
     'regrow_fraction': 0.5,
     'connection_rewire_fraction': 0.5,
     'd_model': 8,
@@ -127,8 +128,8 @@ class EvoConfig:
     mask_thresh_min: float = CONFIG['mask_thresh_min']
     log_dir: Optional[str] = CONFIG['log_dir']
     debug: bool = False
-    max_prune_frac: float = 0.5
-    min_prune_frac: float = 0.01
+    max_prune_frac: float = 0.7
+    min_prune_frac: float = 0.1
     compress_policy: str = 'try_longer_retrain'  # 'rollback' | 'accept_if_compression_win' | 'try_longer_retrain'
     compression_tradeoff: float = 0.15
     long_retrain_epochs: int = 10
@@ -141,15 +142,14 @@ class EvoConfig:
     # New quality-metric toggles and weights
     use_grad_importance: bool = True             # compute activation-gradient importance
     use_weight_grad: bool = True                 # compute kernel * grad(kernel) importance for connections
-    grad_unit_weight: float = 0.3                # how much grad contributes to unit score
-    # grad_weight_weight: float = 0.3              
-    fisher_weight: float = 0.3                   # how much fisher contributes to unit score
+    # grad_unit_weight: float = 0.3                # how much grad contributes to unit score
+    # fisher_weight: float = 0.3                   # how much fisher contributes to unit score
     max_grad_samples: int = CONFIG['max_grad_samples_per_batch'] # cap number of val batches to use for gradient-based scoring
 
     # Ablation / EMA / regrow controls
     ablation_max_batches: int = 32               # val batches to use for ablation scoring
     ablation_max_neurons: int = 256              # max neurons to test per layer
-    ablation_weight: float = 0.3                 # how much ablation contributes to unit score
+    # ablation_weight: float = 0.3                 # how much ablation contributes to unit score
     ema_decay: float = 0.7                       # EMA smoothing factor for unit utilities
     deterministic_regrow_seed: int = SEED        # base seed for deterministic regrow reinit
     regrow_reinit_std: float = 0.01              # relative std when reinitializing regrown connections
@@ -163,6 +163,19 @@ class EvoConfig:
     layer_finetune_batch_size: Optional[int] = CONFIG['batch_size']//4  # fallback to config finetune_batch_size if None
     layer_finetune_lr_mul: float = 0.5               # scale applied to gradients during per-layer finetune (<=1 for conservative)
 
+    # CREC-specific defaults
+    crec_init_regrow_fraction = 0.5
+    crec_max_regrow_fraction = 0.2
+    crec_fisher_target_scale = 0.8
+    crec_entropy_target = 0.5
+    crec_fisher_k = 50.0
+    crec_val_k = 1.0
+    crec_entropy_k = 1.0
+    crec_compression_tradeoff = 1.0
+    crec_momentum = 0.9
+    crec_history_window = 8
+    crec_max_delta_per_step = 0.05
+
 # ---------------------------------------------------------------------------
 # Pareto logger
 # ---------------------------------------------------------------------------
@@ -175,6 +188,183 @@ class ParetoLogger:
 
     def last(self):
         return self.points[-1] if self.points else None
+
+
+# ------------------------------------------------------
+# NeuroAdaptiveCREC: compression & regrowth controller
+# ------------------------------------------------------
+class NeuroAdaptiveCREC:
+    """
+    NeuroAdaptiveCREC:
+    Self-regulating compression–regrowth controller with dynamic Fisher and entropy targets.
+    Balances pruning, regrowth, and model sensitivity automatically.
+    """
+
+    def __init__(self,
+                 init_regrow_fraction=0.05,
+                 max_regrow_fraction=0.25,
+                 fisher_target_scale=0.8,
+                 entropy_target=0.5,
+                 fisher_k=50.0,
+                 val_k=20.0,
+                 entropy_k=10.0,
+                 compression_tradeoff=1.0,
+                 momentum=0.9,
+                 history_window=20,
+                 max_delta_per_step=0.05
+                ):
+
+        # Core parameters
+        self.regrow_fraction = init_regrow_fraction
+        self.max_regrow_fraction = max_regrow_fraction
+        self.fisher_target_scale = fisher_target_scale
+        self.entropy_target = entropy_target
+        self.fisher_k = fisher_k
+        self.val_k = val_k
+        self.entropy_k = entropy_k
+        self.compression_tradeoff = compression_tradeoff
+        self.momentum = momentum
+        self.history_window = history_window
+        self.max_delta_per_step = float(max_delta_per_step)
+
+        # Rolling histories
+        self.fisher_history = []
+        self.entropy_history = []
+        self.val_history = []
+
+        # Internal state
+        self.smoothed_regrow = init_regrow_fraction
+        self.fisher_target = None
+        self.entropy_target_dynamic = entropy_target
+
+    # ------------------------------------------------------
+    # Utility
+    # ------------------------------------------------------
+    def _mask_entropy(self, mask):
+        # mask is expected to be float in [0,1] per-unit. compute fraction active p in [0,1].
+        if getattr(mask, 'size', 0) == 0:
+            return 0.0
+        p = float(np.mean(mask))
+        # numerical guard
+        if p <= 0.0 or p >= 1.0:
+            return 0.0
+        # normalized entropy (divide by ln(2) so max = 1.0)
+        return (-(p * np.log(p) + (1 - p) * np.log(1 - p))) / np.log(2.0)
+
+    # ------------------------------------------------------
+    # Calibration
+    # ------------------------------------------------------
+    def calibrate_targets(self, fisher_metric, mask_entropies):
+        """Update Fisher and entropy targets using rolling median/mean history."""
+        # robust append
+        self.fisher_history.append(float(fisher_metric))
+        self.entropy_history.append(float(np.mean(mask_entropies)) if len(mask_entropies) > 0 else 0.0)
+
+        # keep window
+        if len(self.fisher_history) > self.history_window:
+            self.fisher_history.pop(0)
+            self.entropy_history.pop(0)
+
+        # Dynamic Fisher target = scaled median
+        median_f = float(np.median(self.fisher_history)) if len(self.fisher_history) > 0 else 0.0
+        self.fisher_target = median_f * self.fisher_target_scale
+
+        # Dynamic entropy target: blend between observed mean and 0.5 (normalized domain)
+        mean_ent = float(np.mean(self.entropy_history)) if len(self.entropy_history) > 0 else 0.0
+        # keep in [0,1]
+        self.entropy_target_dynamic = float(np.clip(0.8 * mean_ent + 0.2 * 0.5, 0.0, 1.0))
+
+
+    # ------------------------------------------------------
+    # Core adaptive update
+    # ------------------------------------------------------
+    def update(self, fisher_metric, val_delta, masks):
+        """
+        Update regrow_fraction and compression_tradeoff adaptively.
+        - clamps per-step delta to avoid single-step explosions.
+        - uses normalized entropy in [0,1].
+        """
+        # compute per-layer mask entropy (normalized)
+        mask_entropies = [self._mask_entropy(m) for m in masks if getattr(m, 'size', 0) > 0]
+        mean_entropy = float(np.mean(mask_entropies)) if len(mask_entropies) > 0 else 0.0
+
+        # calibrate targets first (uses rolling history)
+        self.calibrate_targets(fisher_metric, mask_entropies)
+
+        # Compute raw terms
+        # fisher_term: positive if target > observed (i.e. want to regrow to increase fisher)
+        fisher_term = (float(self.fisher_target) - float(fisher_metric)) * float(self.fisher_k)
+
+        # val_term: we expect val_delta = previous_val - current_val so positive => improvement
+        # negative val_delta (performance drop) should encourage regrow (so invert sign)
+        # keep sign convention: more negative val_delta (worse now) => positive regrow encouragement
+        val_term = (-float(val_delta)) * float(self.val_k)
+
+        # entropy_term: normalized difference in [ -1, 1 ] scaled by entropy_k
+        # use normalized entropy scale (both target and observed in [0,1])
+        entropy_diff = float(self.entropy_target_dynamic) - float(mean_entropy)
+        entropy_term = entropy_diff * float(self.entropy_k)
+
+        raw_delta = fisher_term + val_term + entropy_term
+
+        # --- safety guards ---
+        # limit how much the regrow_fraction can move in one call
+        max_step = min(self.max_delta_per_step, 0.5 * float(self.max_regrow_fraction))
+        if max_step is None:
+            # default conservative step: 10% absolute change
+            max_step = 0.1
+        # clip raw_delta to [-max_step, max_step]
+        clipped_delta = float(np.clip(raw_delta, -abs(max_step), abs(max_step)))
+
+        # compute new raw regrow, clip by configured max_regrow_fraction
+        new_r = float(np.clip(self.regrow_fraction + clipped_delta, 0.0, float(self.max_regrow_fraction)))
+
+        # smoothing (momentum) and final clip
+        self.smoothed_regrow = float(self.momentum * self.smoothed_regrow + (1.0 - self.momentum) * new_r)
+        # ensure final regrow_fraction respects bounds
+        self.regrow_fraction = float(np.clip(self.smoothed_regrow, 0.0, float(self.max_regrow_fraction)))
+
+        # update compression tradeoff with small step clipping
+        compression_adjust = (
+            (float(fisher_metric) - float(self.fisher_target)) * 0.05
+            - (mean_entropy - float(self.entropy_target_dynamic)) * 0.1
+        )
+        # clip compression adjust per step
+        compression_adjust = float(np.clip(compression_adjust, -0.2, 0.2))
+        self.compression_tradeoff = float(np.clip(self.compression_tradeoff + compression_adjust, 0.1, 10.0))
+
+        # Save val metric history
+        self.val_history.append(float(val_delta))
+        if len(self.val_history) > self.history_window:
+            self.val_history.pop(0)
+
+        # debug-level return includes components so logs make cause obvious
+        return {
+            "regrow_fraction": self.regrow_fraction,
+            "compression_tradeoff": self.compression_tradeoff,
+            "fisher_target": self.fisher_target,
+            "entropy_target": self.entropy_target_dynamic,
+            "mean_entropy": mean_entropy,
+            "components": {
+                "fisher_term": fisher_term,
+                "val_term": val_term,
+                "entropy_term": entropy_term,
+                "raw_delta": raw_delta,
+                "clipped_delta": clipped_delta,
+                "new_r_pre_smooth": new_r,
+            },
+        }
+
+    # ------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------
+    def summary(self):
+        return {
+            "regrow_fraction": round(self.regrow_fraction, 5),
+            "compression_tradeoff": round(self.compression_tradeoff, 3),
+            "fisher_target": round(self.fisher_target, 6) if self.fisher_target else None,
+            "entropy_target": round(self.entropy_target_dynamic, 4),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +385,7 @@ class EvoCompressor:
 
         # records
         self.history: List[Dict[str, Any]] = []
-        self.pareto_logger = ParetoLogger()
+        self.pareto_logger = defaultdict(list)
         self.conn_age_log = defaultdict(list)
 
         # store last layerwise decisions for regrowth logic / debugging
@@ -204,66 +394,103 @@ class EvoCompressor:
         # internal
         self._setup_logger()
 
-    # ---------------------- logging -----------------------------------------
+        # integrate NeuroAdaptiveCREC instance
+        self.crec = NeuroAdaptiveCREC(
+            init_regrow_fraction=getattr(self.config, 'crec_init_regrow_fraction', 0.05),
+            max_regrow_fraction=getattr(self.config, 'crec_max_regrow_fraction', 0.25),
+            fisher_target_scale=getattr(self.config, 'crec_fisher_target_scale', 0.8),
+            entropy_target=getattr(self.config, 'crec_entropy_target', 0.5),
+            fisher_k=getattr(self.config, 'crec_fisher_k', 50.0),
+            val_k=getattr(self.config, 'crec_val_k', 20.0),
+            entropy_k=getattr(self.config, 'crec_entropy_k', 10.0),
+            compression_tradeoff=getattr(self.config, 'crec_compression_tradeoff', 1.0),
+            momentum=getattr(self.config, 'crec_momentum', 0.9),
+            history_window=getattr(self.config, 'crec_history_window', 20),
+        )
+
+        # track last observed val loss for delta computations
+        self.last_val_loss: Optional[float] = None
+
     def _setup_logger(self):
         name = 'EvoCompressor'
         self.logger = logging.getLogger(name)
-        # avoid duplicated handlers if user re-instantiates multiple compressors
         if not self.logger.handlers:
             level = logging.DEBUG if self.config.debug else logging.INFO
             self.logger.setLevel(level)
             fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-
             ch = logging.StreamHandler()
             ch.setFormatter(fmt)
             ch.setLevel(level)
             self.logger.addHandler(ch)
-
-            if self.config.log_dir:
-                os.makedirs(self.config.log_dir, exist_ok=True)
-                fh = logging.FileHandler(os.path.join(self.config.log_dir, 'evo_compressor.log'))
-                fh.setFormatter(fmt)
-                fh.setLevel(level)
-                self.logger.addHandler(fh)
-
-        # convenience
         self.log = self.logger
 
-    # ---------------------- high-level API ---------------------------------
-    def evaluate_and_compress(self, train_loss: Optional[float] = None, val_loss: Optional[float] = None, do_regrow: bool = True) -> Tuple[Dict[str, Any], float]:
-        """Main entrypoint: two-phase compress (prune -> optional regrow) returning (summary, mask_thresh_min)
+    # The rest of EvoCompressor methods are assumed present unchanged except where we add CREC hooks
 
-        This method mirrors the original logic but routes steps to modular methods. The key difference:
-        - if config.layerwise_prune is True, pruning decisions are taken sequentially per-layer (safer, but more evals)
-        - we maintain neuron-only and connection-only scenarios (no 'both' simultaneous scenario).
-        """
-        self.log.info('Starting evaluate_and_compress cycle')
+    # ------------ hook points inserted into evaluate_and_compress ------------
+    def evaluate_and_compress(self, train_loss: Optional[float] = None, val_loss: Optional[float] = None, do_regrow: bool = True) -> Tuple[Dict[str, Any], float]:
+        self.log.info('Starting evaluate_and_compress cycle (CREC-enabled)')
 
         md_layers = get_masked_dense_layers(self.model)
 
-        # compute utilities
+        # compute utilities (unchanged behavior)
         utilities = self.compute_utilities(md_layers)
 
-        # decide dynamic prune fraction
-        prune_fraction = self._compute_dynamic_prune_fraction(train_loss, val_loss)
-        self.log.info(f'Computed prune_fraction={prune_fraction:.4f}')
+        # --- CREC: derive scalar fisher metric and mask entropies from layer objects ---
+        fisher_vals = []
+        mask_entropies = []
+        for l in md_layers:
+            f = getattr(l, '_last_fisher', None)
+            if f is None or getattr(f, 'size', 0) == 0:
+                continue
+            fisher_vals.append(float(np.mean(np.abs(f))))
+            m = l.mask.numpy()
+            print(f'\nm: {m}\n')
+            # compute simple entropy of mask activation fraction
+            p = float(np.mean(m > 0.5)) if m.size else 0.0
+            print(f'\np: {p}\n')
+            if p > 0 and p < 1.0:
+                mask_entropies.append(-(p * np.log(p) + (1 - p) * np.log(1 - p)))
+            else:
+                mask_entropies.append(0.0)
+
+        print(f'\nfisher_vals: {fisher_vals}\n')
+        print(f'\nmask_entropies: {mask_entropies}\n')
+
+        fisher_metric = float(np.median(fisher_vals)) if fisher_vals else 0.0
 
         # baseline val loss
         baseline_val_loss = self._obtain_baseline_loss(val_loss)
-        self.log.info(f'Baseline validation loss: {baseline_val_loss:.6g}')
 
-        # compute prune candidates (no mutation yet)
+        # compute val_delta relative to last observed val
+        if self.last_val_loss is None:
+            val_delta = 0.0
+        else:
+            # positive = improvement (previous -> current lowered loss)
+            val_delta = float(self.last_val_loss - baseline_val_loss)
+
+        # update CREC with current signals
+        try:
+            crec_info = self.crec.update(fisher_metric, val_delta, [l.mask.numpy() for l in md_layers])
+            self.log.debug(f'CREC update: {crec_info}')
+        except Exception as e:
+            self.log.warning(f'CREC update failed: {e}')
+            crec_info = self.crec.summary()
+
+        # decide dynamic prune fraction (CREC may influence future regrow)
+        prune_fraction = self._compute_dynamic_prune_fraction(train_loss, val_loss)
+        self.log.info(f'Computed prune_fraction={prune_fraction:.4f}')
+
+        # compute prune candidates
         stored_prune_info, total_alive_pre, mask_thresh_min = self.compute_prune_candidates(md_layers, utilities, prune_fraction)
         self.log.info(f'Total alive neurons pre-prune: {total_alive_pre}')
 
-        # decide scenarios and evaluate - now layer-aware
+        # proceed with prune evaluation and regrowth as before
         best_scenario, pruned_val_loss, baseline_weights = self._search_or_apply_scenarios(stored_prune_info, total_alive_pre)
         self.log.info(f'Chosen pruning scenario: {best_scenario} => pruned_val_loss={pruned_val_loss:.6g}')
 
         regrow_triggered = False
         val_loss_after_regrow = pruned_val_loss
 
-        # regrow decision (global), but we will prefer layer-targeted regrowth
         if do_regrow and (pruned_val_loss > baseline_val_loss * (1.0 + self.config.regrow_loss_tol)):
             self.log.info('Pruned model degraded beyond tolerance; evaluating finetune before regrow')
             val_after_ft = self._finetune_short()
@@ -273,25 +500,32 @@ class EvoCompressor:
                 self.log.info('Short finetune recovered performance; skipping regrowth')
                 val_loss_after_regrow = val_after_ft
             else:
-                # select layers to target for regrowth based on per-layer deltas recorded during layerwise prune
-                self.log.info('Short finetune did NOT recover performance; performing selective regrowth')
                 regrow_triggered = True
 
-                # find target layers that individually caused the largest relative loss increases
+                # use CREC regrow_fraction override if provided
+                target_regrow_frac = crec_info.get('regrow_fraction', getattr(self.config, 'regrow_fraction', 0.05))
+
+                # choose target layers based on stored per-layer rel_delta and CREC-guided regrow fraction
                 target_layers = []
                 for lname, info in stored_prune_info.items():
                     rel = info.get('rel_delta', 0.0)
+                    # if layer caused notable relative degradation, target it
                     if rel >= self.config.layer_regrow_min_rel_loss:
                         target_layers.append(lname)
 
                 if not target_layers:
-                    # fallback: if no per-layer deltas available, regrow everything
                     self.log.debug('No per-layer delta exceeded threshold; regrowing across all layers')
                     target_layers = list(stored_prune_info.keys())
 
-                self.perform_regrowth(stored_prune_info, utilities, target_layers=target_layers)
+                # temporarily override config.regrow_fraction for deterministic regrow counts
+                old_rf = getattr(self.config, 'regrow_fraction', 0.05)
+                try:
+                    self.config.regrow_fraction = float(np.clip(target_regrow_frac, 0.0, self.crec.max_regrow_fraction))
+                    self.perform_regrowth(stored_prune_info, utilities, target_layers=target_layers)
+                finally:
+                    # restore config value
+                    self.config.regrow_fraction = old_rf
 
-                # evaluate after regrowth
                 val_metrics_after = self._evaluate_val()
                 val_loss_after_regrow = float(val_metrics_after[0])
                 self.log.info(f'Val loss after regrowth: {val_loss_after_regrow:.6g}')
@@ -302,32 +536,31 @@ class EvoCompressor:
         val_loss_final = float(val_metrics_final[0])
         self.log.info(f'Final validation loss: {val_loss_final:.6g}')
 
-        # run post-compression decision logic
-        baseline_weights_for_decision = baseline_weights
+        # post-compression decision - inject CREC's compression_tradeoff as suggestion
+        compression_tradeoff_for_decision = crec_info.get('compression_tradeoff', getattr(self.config, 'compression_tradeoff', 0.15))
         action, reason = self._post_compression_decision(
             baseline_val_loss=baseline_val_loss,
             val_loss_final=val_loss_final,
             baseline_alive=total_alive_pre,
             final_alive=int(sum(r['alive_neurons'] for r in df_rows)),
-            baseline_weights=baseline_weights_for_decision,
-            policy=self.config.compress_policy,
+            baseline_weights=baseline_weights,
+            policy=self.config.compress_policy if hasattr(self.config, 'compress_policy') else 'rollback',
             rel_tol=0.01,
-            compression_tradeoff=self.config.compression_tradeoff,
+            compression_tradeoff=compression_tradeoff_for_decision,
             long_retrain_epochs=self.config.long_retrain_epochs,
             train_ds=self.train_ds,
             finetune_bs=self.config.finetune_batch_size
         )
         self.log.info(f'Post-compression decision: action={action}; reason={reason}')
 
-        # recompute df_rows if rollback
         if action.startswith('rolled_back'):
-            df_rows = self.finalize_stats()  # recompute to reflect rollback
+            df_rows = self.finalize_stats()
             val_metrics_final = self._evaluate_val()
             val_loss_final = float(val_metrics_final[0])
 
-        # pareto / history
         total_alive_now = int(sum(r['alive_neurons'] for r in df_rows))
-        self.pareto_logger.add(total_alive_now, val_loss_final)
+        # record CREC summary in history
+        crec_summary = self.crec.summary()
 
         summary = {
             'alive_total': total_alive_now,
@@ -339,8 +572,12 @@ class EvoCompressor:
             'val_loss_final': float(val_loss_final),
             'action': action,
             'reason': reason,
+            'crec': crec_summary,
         }
         self.history.append(summary)
+
+        # update last_val_loss for next cycle
+        self.last_val_loss = val_loss_final
 
         # persist snapshot CSV
         if self.config.log_dir:
@@ -352,8 +589,9 @@ class EvoCompressor:
         # print age monitor
         for lname, stats in self.conn_age_log.items():
             last = stats[-1]
-            self.log.info(f"[AGE MONITOR] {lname}: mean={last['mean']:.2f}, std={last['std']:.2f}, max={last['max']:.0f}, alive={last['alive_count']}")
+            self.log.info(f"[AGE MONITOR] {lname}: mean={last['mean']:.2f}, std={last['std']:.2f}, max={last['max']:.0f}, alive={last['alive_count']}")        
 
+        # return summary and mask threshold minimum used earlier
         return summary, mask_thresh_min
 
     # ---------------------- Low-cost approximate ablation -----------------------------
@@ -459,6 +697,30 @@ class EvoCompressor:
         Uses vmapped per-example gradients when possible and monkeypatch capture fallback otherwise.
         Returns utilities: dict unique_layer_name -> per-unit utility (EMA-smoothed).
         """
+
+        # Adaptive signal weighting (reliability-based)
+        def adaptive_weights(G, F, A, eps=1e-8):
+            """Compute dynamic α, β, γ based on signal reliability (1 / variance)."""
+            sigs = [G, F, A]
+            reliabilities = []
+            for sig in sigs:
+                if sig is None or np.all(sig == 0):
+                    reliabilities.append(0.0)
+                else:
+                    reliabilities.append(1.0 / (np.var(sig) + eps))
+            reliabilities = np.array(reliabilities, dtype=np.float32)
+            total = np.sum(reliabilities) + eps
+            return reliabilities / total
+
+        # normalization helper
+        def _norm_arr(x):
+            x = np.asarray(x, dtype=np.float32)
+            if x.size == 0:
+                return x
+            x = x - np.median(x)
+            s = np.std(x) + 1e-9
+            return (x / s)            
+        
         self.log.debug('Computing quality-aware utilities (grad-based + fisher)')
     
         # 1) activation stats
@@ -537,7 +799,7 @@ class EvoCompressor:
                     def per_example_fn(xi, yi, _subm=subm, _layer=layer):
                         xi_b = tf.expand_dims(xi, 0)
                         yi_b = tf.expand_dims(yi, 0)
-                        with tf.GradientTape() as tape:
+                        with tf.GradientTape(persistent=True) as tape:
                             act_b, pred_b = _subm(xi_b, training=False)
                             tape.watch(act_b)
                             loss_b = tf.reshape(loss_fn(yi_b, pred_b), [])
@@ -562,6 +824,7 @@ class EvoCompressor:
                                 gk = tf.zeros_like(_layer.kernel)
                         else:
                             gk = tf.constant([], dtype=tf.float32)
+                        del tape
                         return unit_mag, gk
     
                     # run vectorized_map safely
@@ -659,7 +922,13 @@ class EvoCompressor:
                             # we skip per-weight grads here (caller can rely on vmapped path or layer.kernel grads)
                 finally:
                     tf.config.run_functions_eagerly(prev)
-    
+
+        try:
+            ablation = self.approx_ablation_scores(md_layers)
+        except Exception as e:
+            self.log.debug(f'Ablation scoring failed: {e}')
+            ablation = {}
+
         # finalize accumulators and assemble utilities
         for layer in md_layers:
             unique_name = f"{layer.name}_{hex(id(layer))}"
@@ -677,57 +946,11 @@ class EvoCompressor:
                 except Exception:
                     gweight = np.array([])
     
-            # normalization helper
-            def _norm_arr(x):
-                x = np.asarray(x, dtype=np.float32)
-                if x.size == 0:
-                    return x
-                x = x - np.median(x)
-                s = np.std(x) + 1e-9
-                return (x / s)
-    
             gunit_n = _norm_arr(gunit)
+            
             f = fisher.get(unique_name, np.zeros_like(gunit))
             f_n = _norm_arr(f)
-    
-            alpha = float(getattr(self.config, 'grad_unit_weight', 1.0))
-            beta = float(getattr(self.config, 'fisher_weight', 1.0))
-            gamma = float(getattr(self.config, 'ablation_weight', 0.0))
-            unit_score = alpha * gunit_n + beta * f_n  # ablation added later
-    
-            utilities[unique_name] = unit_score
-            setattr(layer, '_last_grad_weight_importance', gweight)
-            setattr(layer, '_last_grad_unit_importance', gunit)
-            setattr(layer, '_last_fisher', f)
-            setattr(layer, '_last_unit_score', unit_score)
-    
-        # ablation (cheap) and final combination + EMA
-        try:
-            ablation = self.approx_ablation_scores(md_layers)
-        except Exception as e:
-            self.log.debug(f'Ablation scoring failed: {e}')
-            ablation = {}
-    
-        for layer in md_layers:
-            unique_name = f"{layer.name}_{hex(id(layer))}"
-    
-            raw_gunit = getattr(layer, '_last_grad_unit_importance', None)
-            if raw_gunit is None:
-                raw_gunit = np.zeros((getattr(layer, 'units', 0),), dtype=np.float32)
-            arr = np.asarray(raw_gunit, dtype=np.float32)
-            arr = arr - np.median(arr) if arr.size else arr
-            s = np.std(arr) + 1e-9 if arr.size else 1.0
-            gunit_n = (arr / s) if arr.size else arr
-    
-            f = getattr(layer, '_last_fisher', None)
-            if f is None:
-                f_arr = np.zeros_like(gunit_n)
-            else:
-                arrf = np.asarray(f, dtype=np.float32)
-                arrf = arrf - np.median(arrf)
-                s2 = np.std(arrf) + 1e-9
-                f_arr = (arrf / s2)
-    
+
             a = ablation.get(unique_name, None)
             if a is None:
                 a_n = np.zeros_like(gunit_n)
@@ -735,19 +958,30 @@ class EvoCompressor:
                 arra = np.asarray(a, dtype=np.float32)
                 arra = arra - np.median(arra)
                 s3 = np.std(arra) + 1e-9
-                a_n = (arra / s3)
+                a_n = (arra / s3)             
 
-            # print(f'\ngunit_n:\n{gunit_n}')
-            # print(f'\nf_arr:\n{f_arr}')
-            # print(f'\na_n:\n{a_n}\n')
+            # print(f'\nUtility results for {unique_name}:')
+            # print(f'\nFisher: \n{f}')
+            # print(f'\nAblation: \n{a}')
+            # print(f'\nGradUnit: \n{gunit}\n')
+            # utilities[unique_name] = unit_score
+            setattr(layer, '_last_grad_weight_importance', gweight)
+            setattr(layer, '_last_grad_unit_importance', gunit)
+            setattr(layer, '_last_fisher', f)
             
-            alpha = float(getattr(self.config, 'grad_unit_weight', 1.0))
-            beta = float(getattr(self.config, 'fisher_weight', 1.0))
-            gamma = float(getattr(self.config, 'ablation_weight', 0.0))
-            unit_score = alpha * gunit_n + beta * f_arr + gamma * a_n
+            # Get dynamic alpha, beta, gamma per layer
+            alpha, beta, gamma = adaptive_weights(gunit, f, a)
     
+            # Combine normalized signals
+            unit_score = alpha * gunit_n + beta * f_n + gamma * a_n              
+    
+            setattr(layer, '_last_adaptive_weights', (alpha, beta, gamma))
             setattr(layer, '_last_unit_score', unit_score.astype(np.float32))
-            decay = float(getattr(self.config, 'ema_decay', 0.9))
+            
+            # ---------------------------------------------------------------
+            # EMA smoothing across cycles
+            # ---------------------------------------------------------------
+            decay = float(self.config.ema_decay)
             prev = getattr(layer, '_ema_unit_score', None)
             if prev is None:
                 ema = unit_score.copy()
@@ -755,7 +989,16 @@ class EvoCompressor:
                 ema = decay * np.asarray(prev, dtype=np.float32) + (1.0 - decay) * unit_score
             setattr(layer, '_ema_unit_score', ema.astype(np.float32))
     
+            # Final per-layer utility exposed to pruning logic
             utilities[unique_name] = ema.astype(np.float32)
+    
+            # Debug logging
+            self.log.debug(
+                f'Adaptive utilities for {unique_name}: '
+                f'α={alpha:.3f}, β={beta:.3f}, γ={gamma:.3f}, '
+                f'units={unit_score.size}'
+                
+            )
             self.log.debug(f'Computed quality utility for {unique_name} (units={unit_score.size})')
     
         return utilities    
@@ -853,10 +1096,10 @@ class EvoCompressor:
                     layer.prune_units(info['prune_idx'])
             elif scenario == 'connections':
                 if info.get('conn_low_pairs', None) is not None and getattr(info['conn_low_pairs'], 'size', 0) > 0:
-                    self.log.debug(f'Applying connection prune to {unique_name}: n_pairs={len(info["conn_low_pairs"])})')
+                    self.log.debug(f'Applying connection prune to {unique_name}: n_pairs={len(info["conn_low_pairs"])}')
                     layer.prune_connections(info['conn_low_pairs'])
             else:
-                self.log.warning(f'Unknown prune scenario requested: {scenario} (supported: neurons, connections)')
+                self.log.warning(f'\nUnknown prune scenario requested: {scenario} (supported: neurons, connections)\n')
 
     def _evaluate_val(self):
         if isinstance(self.val_ds, tuple) and isinstance(self.val_ds[0], np.ndarray):
@@ -1257,7 +1500,7 @@ class EvoCompressor:
     def _compute_dynamic_prune_fraction(self, train_loss, val_loss):
         prune_fraction = self.config.base_prune
         if train_loss is not None and val_loss is not None:
-            gap = float(val_loss - train_loss)
+            gap = float(abs(val_loss - train_loss))
             rel = gap / (abs(val_loss) + 1e-9)
             prune_fraction = float(self.config.base_prune * (1.0 + rel))
             prune_fraction = np.clip(prune_fraction, self.config.min_prune_frac, self.config.max_prune_frac)
@@ -1571,7 +1814,8 @@ class MaskedDense(keras.layers.Layer):
 def build_transformer_model(seq_len, d_model, num_layers, num_heads, ff_dim):
     inp = keras.layers.Input(shape=(seq_len, 1))
     x = norm(inp)
-    x = keras.layers.Dense(d_model)(x)
+    # x = keras.layers.Dense(d_model)(x)
+    x = MaskedDense(d_model, activation=None, name='proj_dense')(x)
     pe = positional_encoding(seq_len, d_model)
     x = x + pe
     for i in range(num_layers):
@@ -1937,66 +2181,100 @@ def approx_fisher_per_sample(model: keras.Model,
 
     # Attempt to create functional submodels
     submodels = {}
+    functional_layers = []
+    functional_keys = []
     for l in md_layers:
         key = f"{l.name}_{hex(id(l))}"
         try:
             submodels[key] = keras.Model(model.inputs, l.output)
+            functional_layers.append(l)
+            functional_keys.append(key)            
         except Exception:
             submodels[key] = None
 
-    # Prepare vmapped per-layer per-example function for layers with submodels
+    multi_subm = None
+    key_to_index = {}
+    if functional_layers:
+        try:
+            outputs = [model.output] + [l.output for l in functional_layers]
+            multi_subm = keras.Model(model.inputs, outputs)
+            # build mapping from key to index in outputs (1-based because 0 is pred)
+            for idx, key in enumerate(functional_keys, start=1):
+                key_to_index[key] = idx
+        except Exception:
+            multi_subm = None
+            key_to_index = {}            
+
+    # --- Create vmapped_fns only for those layers we can extract from multi_subm ---
     vmapped_fns = {}
     seq_len = int(CONFIG.get('seq_len', 1))
     feature_dim = int(CONFIG.get('feature_dim', 1)) if CONFIG.get('feature_dim') else 1
-
-    for l in md_layers:
-        key = f"{l.name}_{hex(id(l))}"
-        subm = submodels.get(key)
-        if subm is None:
-            continue
-
-        # per-example function (wrapped as tf.function to reduce retracing)
+    
+    if multi_subm is not None:
+        # single per-example fn that uses multi_subm and extracts desired activation by index
         @tf.function(input_signature=[
             tf.TensorSpec(shape=(seq_len, feature_dim), dtype=tf.float32),
             tf.TensorSpec(shape=(), dtype=tf.float32)
         ])
-        def per_example_fn(x_i, y_i, _subm=subm):
-            x_b = tf.expand_dims(x_i, 0)   # shape (1, seq_len, feat)
+        def per_example_multi(x_i, y_i):
+            x_b = tf.expand_dims(x_i, 0)
             y_b = tf.expand_dims(y_i, 0)
             with tf.GradientTape() as tape:
-                out_b = _subm(x_b, training=False)    # (1, ..., units)
-                tape.watch(out_b)
-                pred_b = model(x_b, training=False)   # (1, ...)
+                outs = multi_subm(x_b, training=False)  # list: [pred, act1, act2, ...]
+                pred_b = outs[0]
+                # we won't watch all activations; caller will request the index it cares about
                 loss_b = tf.reshape(loss_fn(y_b, pred_b), [])
-            g = tape.gradient(loss_b, out_b)
-            if g is None:
-                units = tf.shape(out_b)[-1]
-                return tf.zeros((units,), dtype=tf.float32)
-            g0 = g[0]
-            # collapse non-last dims into unit magnitude
-            if tf.rank(g0) == 1:
-                unit_mag = tf.abs(g0)
-            else:
-                sq = tf.square(g0)
-                reduce_axes = tf.range(tf.rank(g0) - 1)
-                reduced = tf.sqrt(tf.reduce_sum(sq, axis=reduce_axes))
-                unit_mag = reduced
-            return tf.cast(unit_mag, tf.float32)
-
-        # vmapped caller
-        def make_vmapped(fn):
+            # return both loss and list of activations (we compute gradient for a requested activation later)
+            return outs, loss_b
+    
+        # wrapper that given key returns function that computes per-example unit magnitudes
+        def make_vmapped_for_key(idx):
+            # idx is index in outs for this layer (1-based)
             def call_vmapped(x_small, y_small):
+                # vectorized_map over examples
+                def per_e(elems):
+                    x_e, y_e = elems[0], elems[1]
+                    outs, loss_scalar = per_example_multi(x_e, y_e)
+                    # outs is a list-like structure; pick element idx
+                    out_t = outs[idx]
+                    # create tape to compute gradient of scalar w.r.t out_t
+                    with tf.GradientTape() as t2:
+                        # we need out_t to be watched and available in t2 context
+                        t2.watch(out_t)
+                        # loss already computed but we must re-evaluate or reuse: recompute pred/loss cheaply
+                        # —— to keep it simple, recompute pred & loss here using a small call (one forward)
+                        pred_again = outs[0]
+                        # loss_scalar already available
+                        loss_val = loss_scalar
+                    g = t2.gradient(loss_val, out_t)
+                    # print(f'\ng is:\n{g}\n')
+                    if g is None:
+                        units = tf.shape(out_t)[-1] if tf.rank(out_t) > 0 else 1
+                        return tf.zeros((units,), dtype=tf.float32)
+                    g0 = g[0] if tf.rank(g) > 0 else g
+                    if tf.rank(g0) == 1:
+                        unit_mag = tf.abs(g0)
+                    else:
+                        sq = tf.square(g0)
+                        reduce_axes = tf.range(tf.rank(g0) - 1)
+                        reduced = tf.sqrt(tf.reduce_sum(sq, axis=reduce_axes))
+                        unit_mag = reduced
+                    return tf.cast(unit_mag, tf.float32)
+    
                 try:
-                    return tf.vectorized_map(lambda elems: fn(elems[0], elems[1]), (x_small, y_small))
+                    mapped = tf.vectorized_map(lambda elems: per_e((elems[0], elems[1])), (x_small, y_small))
+                    return mapped
                 except Exception:
-                    # fallback python loop
                     lst = []
                     for i in range(int(tf.shape(x_small)[0])):
-                        lst.append(fn(x_small[i], y_small[i]))
+                        lst.append(per_e((x_small[i], y_small[i])))
                     return tf.stack(lst, axis=0)
             return call_vmapped
-
-        vmapped_fns[key] = make_vmapped(per_example_fn)
+    
+        # populate vmapped_fns for all keys present in key_to_index
+        for key, idx in key_to_index.items():
+            vmapped_fns[key] = make_vmapped_for_key(idx)
+            # print(f'\nvmapped_fns: {vmapped_fns}\n')
 
     # accumulators
     fisher = {f"{l.name}_{hex(id(l))}": np.zeros((getattr(l, 'units', 0),), dtype=np.float32) for l in md_layers}
@@ -2024,10 +2302,10 @@ def approx_fisher_per_sample(model: keras.Model,
         need_fallback = []
         for l in md_layers:
             key = f"{l.name}_{hex(id(l))}"
-            if key in vmapped_fns:
-                have_vmapped.append((l, key))
-            else:
-                need_fallback.append((l, key))
+            # if key in vmapped_fns:
+            #     have_vmapped.append((l, key))
+            # else:
+            need_fallback.append((l, key))
 
         # fast vmapped path
         if have_vmapped:
@@ -2131,7 +2409,7 @@ def run_experiment(model, train_ds, val_ds, config, mask_thresh_min):
         keras.callbacks.TensorBoard(log_dir=log_dir),
         keras.callbacks.ModelCheckpoint(chkpt_path, save_best_only=True, monitor='val_loss'),
         keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
-        keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.95, patience=5, cooldown=10),
+        # keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.95, patience=5, cooldown=10),
     ]
     print('\nWarmup training...\n')
     model.summary()
@@ -2139,7 +2417,7 @@ def run_experiment(model, train_ds, val_ds, config, mask_thresh_min):
         train_ds[0], train_ds[1],
         batch_size=config['batch_size'],
         validation_data=(val_ds[0], val_ds[1]),
-        epochs=1,
+        epochs=CONFIG['warm_up_epochs'],
         callbacks=callbacks,
         verbose=2
     )
@@ -2253,6 +2531,6 @@ if __name__ == '__main__':
     trained_model, compressor = run_experiment(model, train_ds, val_ds, CONFIG, MASK_THRESH_MIN)
     print('\nFinal alive neuron counts per masked layer:')
     md_layers = get_masked_dense_layers(trained_model)
-    for l in md_layers:
-        print(f"{l.name}_{hex(id(l))}", int(l.mask.numpy().sum()), '/', l.units)
+    # for l in md_layers:
+    #     print(f"{l.name}_{hex(id(l))}", int(l.mask.numpy().sum()), '/', l.units)
     print('Logs and snapshots saved to', CONFIG['log_dir'])
