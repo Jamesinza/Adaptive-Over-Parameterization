@@ -73,22 +73,29 @@ CONFIG = {
     'train_size': len(train_data),
     'val_size': len(val_data),
     'batch_size': batch_size,
-    'epochs_per_phase': 2,
+    'epochs_per_phase': 10,
     'cycles': 64,
     'regrow_finetune_steps': 5,
     'mask_thresh_min': 0.1,
     'mask_thresh_multi': 0.05,
     'prune_fraction': 0.25,
-    'regrow_fraction': 1.0,
+    'regrow_fraction': 0.5,
     'connection_rewire_fraction': 0.25,
     'd_model': 8,
     'hidden_units': 32,
     'hidden_layers': 2,
     'num_heads': 8,
     'learning_rate': 1e-3,
-    'max_fisher_samples_per_batch': 4,
-    'log_dir': './logs/adaptive_overparam_' + datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    'max_fisher_samples_per_batch': 16,
+    'log_dir': './logs/adaptive_overparam_' + datetime.datetime.now().strftime('%Y%m%d_%H%M%S'),
+    'cycle_patience': 10,
+    'cycle_min_delta': 1e-10,
+    'cycle_monitor': 'val_loss_final',
+    'save_best_cycle_model': True,
+    'cycle_min_rel': 1e-3,   # relative improvement (default 0.1%)
+    'cycle_min_abs': 1e-12,  # absolute fallback        
 }
+
 MASK_THRESH_MIN = CONFIG['mask_thresh_min']
 os.makedirs(CONFIG['log_dir'], exist_ok=True)
 X_train, Y_train = make_dataset(train_data, CONFIG['train_size'], CONFIG['seq_len'])
@@ -271,7 +278,6 @@ class TransformerBlock(keras.layers.Layer):
         config.update({'d_model': self.d_model,
                        'num_heads': self.num_heads,
                        'ff_dim': self.ff_dim,
-                       # 'drop_rate': self.drop_rate
                       })
         return config
 
@@ -752,7 +758,7 @@ def approx_fisher_per_sample(model, dataset, loss_fn, max_samples_per_batch=8, b
     return fisher
 
 # ---------------------------------------------------------------------------
-# Configuration dataclass
+# Configuration dataclass (extended for layer-wise control + quality metrics)
 # ---------------------------------------------------------------------------
 @dataclass
 class EvoConfig:
@@ -773,6 +779,20 @@ class EvoConfig:
     compression_tradeoff: float = 0.15
     long_retrain_epochs: int = 10
 
+    # New layer-wise options
+    layerwise_prune: bool = True                 # perform sequential layer-wise testing & pruning
+    layer_prune_rel_tol: float = 0.005           # per-layer allowed relative loss increase when accepting a layer prune
+    layer_regrow_min_rel_loss: float = 0.002     # regrow only layers that individually caused at least this rel-loss
+
+    # New quality-metric toggles and weights
+    use_grad_importance: bool = True             # compute activation-gradient importance
+    use_weight_grad: bool = True                 # compute kernel * grad(kernel) importance for connections
+    grad_unit_weight: float = 0.6
+    grad_weight_weight: float = 0.3
+    fisher_weight: float = 0.1
+    max_grad_samples: int = 64                   # cap number of val batches to use for gradient-based scoring
+
+
 # ---------------------------------------------------------------------------
 # Pareto logger
 # ---------------------------------------------------------------------------
@@ -786,8 +806,9 @@ class ParetoLogger:
     def last(self):
         return self.points[-1] if self.points else None
 
+
 # ---------------------------------------------------------------------------
-# EvoCompressor (modular)
+# EvoCompressor (modular, layer-aware pruning/regrowth)
 # ---------------------------------------------------------------------------
 class EvoCompressor:
     def __init__(
@@ -806,6 +827,9 @@ class EvoCompressor:
         self.history: List[Dict[str, Any]] = []
         self.pareto_logger = ParetoLogger()
         self.conn_age_log = defaultdict(list)
+
+        # store last layerwise decisions for regrowth logic / debugging
+        self.last_layer_decisions: Dict[str, Dict[str, Any]] = {}
 
         # internal
         self._setup_logger()
@@ -839,7 +863,9 @@ class EvoCompressor:
     def evaluate_and_compress(self, train_loss: Optional[float] = None, val_loss: Optional[float] = None, do_regrow: bool = True) -> Tuple[Dict[str, Any], float]:
         """Main entrypoint: two-phase compress (prune -> optional regrow) returning (summary, mask_thresh_min)
 
-        This method mirrors the original logic but routes steps to modular methods.
+        This method mirrors the original logic but routes steps to modular methods. The key difference:
+        - if config.layerwise_prune is True, pruning decisions are taken sequentially per-layer (safer, but more evals)
+        - we maintain neuron-only and connection-only scenarios (no 'both' simultaneous scenario).
         """
         self.log.info('Starting evaluate_and_compress cycle')
 
@@ -860,14 +886,14 @@ class EvoCompressor:
         stored_prune_info, total_alive_pre, mask_thresh_min = self.compute_prune_candidates(md_layers, utilities, prune_fraction)
         self.log.info(f'Total alive neurons pre-prune: {total_alive_pre}')
 
-        # decide scenarios and evaluate
+        # decide scenarios and evaluate - now layer-aware
         best_scenario, pruned_val_loss, baseline_weights = self._search_or_apply_scenarios(stored_prune_info, total_alive_pre)
         self.log.info(f'Chosen pruning scenario: {best_scenario} => pruned_val_loss={pruned_val_loss:.9f}')
 
         regrow_triggered = False
         val_loss_after_regrow = pruned_val_loss
 
-        # regrow decision
+        # regrow decision (global), but we will prefer layer-targeted regrowth
         if do_regrow and (pruned_val_loss > baseline_val_loss * (1.0 + self.config.regrow_loss_tol)):
             self.log.info('Pruned model degraded beyond tolerance; evaluating finetune before regrow')
             val_after_ft = self._finetune_short()
@@ -877,9 +903,23 @@ class EvoCompressor:
                 self.log.info('Short finetune recovered performance; skipping regrowth')
                 val_loss_after_regrow = val_after_ft
             else:
-                self.log.info('Short finetune did NOT recover performance; performing regrowth')
+                # select layers to target for regrowth based on per-layer deltas recorded during layerwise prune
+                self.log.info('Short finetune did NOT recover performance; performing selective regrowth')
                 regrow_triggered = True
-                self.perform_regrowth(stored_prune_info, utilities)
+
+                # find target layers that individually caused the largest relative loss increases
+                target_layers = []
+                for lname, info in stored_prune_info.items():
+                    rel = info.get('rel_delta', 0.0)
+                    if rel >= self.config.layer_regrow_min_rel_loss:
+                        target_layers.append(lname)
+
+                if not target_layers:
+                    # fallback: if no per-layer deltas available, regrow everything
+                    self.log.debug('No per-layer delta exceeded threshold; regrowing across all layers')
+                    target_layers = list(stored_prune_info.keys())
+
+                self.perform_regrowth(stored_prune_info, utilities, target_layers=target_layers)
 
                 # evaluate after regrowth
                 val_metrics_after = self._evaluate_val()
@@ -948,30 +988,174 @@ class EvoCompressor:
 
     # ---------------------- utility computation -----------------------------
     def compute_utilities(self, md_layers) -> Dict[str, np.ndarray]:
-        self.log.debug('Computing activations and utility scores (entropy + fisher)')
+        """Compute per-layer and per-unit utilities that reflect QUALITY, not just raw activity.
+
+        New approach:
+        - Keep fisher (approx second-order importance) as a stable signal
+        - Add gradient-based unit importance: mean(abs(activation * dL/dactivation)) across validation samples
+        - Add weight-gradient importance for connections: mean(abs(kernel * dkernel)) across samples
+        - Combine normalized signals using config weights to produce a single importance score per unit
+
+        Returns a dict mapping unique layer name -> per-unit utility array (higher == more important)
+        """
+        self.log.debug('Computing quality-aware utilities (grad-based + fisher)')
+
+        # 1) activation stats (no gradients)
         acts = capture_activations(self.model, self.val_ds, masked_layers=md_layers)
         entropies = {name: compute_activation_entropy(a) for name, a in acts.items()}
+
+        # 2) fisher (approx second-order)
         fisher = approx_fisher_per_sample(
             self.model, self.val_ds, keras.losses.Huber(),
             max_samples_per_batch=CONFIG['max_fisher_samples_per_batch']
         )
 
         utilities: Dict[str, np.ndarray] = {}
-        for name in entropies:
-            e = entropies[name]
-            f = fisher.get(name, np.zeros_like(e))
-            if e.size == 0 or f.size == 0:
-                self.log.debug(f'Empty utility parts for {name} -> skipping')
-                continue
-            e_norm = (e - np.median(e)) / (np.std(e) + 1e-9)
-            f_norm = (f - np.median(f)) / (np.std(f) + 1e-9)
-            utilities[name] = 0.5 * e_norm + 0.5 * f_norm
-            self.log.debug(f'Utility computed for {name} (len={utilities[name].size})')
+
+        # 3) gradient-based importance (per-unit and per-connection)
+        # We'll compute gradients over a limited number of batches for efficiency
+        use_grad = getattr(self.config, 'use_grad_importance', True)
+        use_wgrad = getattr(self.config, 'use_weight_grad', True)
+        max_batches = max(1, int(self.config.max_grad_samples))
+
+        # Prepare a small generator over validation data (numpy tuple or tf.data)
+        if isinstance(self.val_ds, tuple) and isinstance(self.val_ds[0], np.ndarray):
+            X_val, y_val = self.val_ds
+            val_iter = numpy_batch_iter(X_val, y_val, CONFIG['batch_size'])
+        else:
+            # assume tf.data
+            val_iter = iter(self.val_ds)
+
+        # cached grads and counts per layer
+        grad_unit_accum = {f"{l.name}_{hex(id(l))}": None for l in md_layers}
+        grad_unit_count = {k: 0 for k in grad_unit_accum}
+        grad_weight_accum = {k: None for k in grad_unit_accum}
+
+        # We'll construct per-layer submodels to expose activation tensors and compute gradients
+        layer_submodels = {}
+        try:
+            for layer in md_layers:
+                unique_name = f"{layer.name}_{hex(id(layer))}"
+                # model outputs: (layer_activation, full_model_output)
+                layer_submodels[unique_name] = keras.Model(self.model.inputs, [layer.output, self.model.output])
+        except Exception as e:
+            self.log.warning(f'Failed to build layer submodels for gradient importance: {e}')
+            use_grad = False
+            use_wgrad = False
+
+        # iterate over batches (bounded by max_batches)
+        batches_done = 0
+        loss_fn = keras.losses.get(keras.losses.Huber())
+        for batch in val_iter:
+            if batches_done >= max_batches:
+                break
+            batches_done += 1
+
+            if isinstance(self.val_ds, tuple) and isinstance(self.val_ds[0], np.ndarray):
+                xb, yb = batch
+            else:
+                xb, yb = batch
+
+            xb_tf = tf.convert_to_tensor(xb)
+            yb_tf = tf.convert_to_tensor(yb)
+
+            if use_grad and layer_submodels:
+                for layer in md_layers:
+                    unique_name = f"{layer.name}_{hex(id(layer))}"
+                    subm = layer_submodels.get(unique_name)
+                    if subm is None:
+                        continue
+                    with tf.GradientTape() as tape:
+                        # forward pass: capture activation and preds
+                        act, preds = subm(xb_tf, training=False)
+                        tape.watch(act)
+                        loss = loss_fn(yb_tf, preds)
+                    # gradient wrt activation (shape: batch x units)
+                    grad_act = tape.gradient(loss, act)
+                    if grad_act is None:
+                        continue
+                    act_np = act.numpy()
+                    grad_np = grad_act.numpy()
+                    # importance per-unit: mean(abs(act * grad)) across batch
+                    per_unit_imp = np.mean(np.abs(act_np * grad_np), axis=0)
+
+                    if grad_unit_accum[unique_name] is None:
+                        grad_unit_accum[unique_name] = per_unit_imp
+                    else:
+                        grad_unit_accum[unique_name] += per_unit_imp
+                    grad_unit_count[unique_name] += 1
+
+                    # weight gradient importance: gradient wrt kernel
+                    if use_wgrad:
+                        try:
+                            # compute gradient w.r.t. kernel (connection importance)
+                            kernel = layer.kernel
+                            with tf.GradientTape() as tape2:
+                                act2, preds2 = subm(xb_tf, training=False)
+                                loss2 = loss_fn(yb_tf, preds2)
+                            grad_kernel = tape2.gradient(loss2, kernel)
+                            if grad_kernel is not None:
+                                grad_k_np = grad_kernel.numpy()
+                                w_imp = np.abs(kernel.numpy() * grad_k_np)
+                                if grad_weight_accum[unique_name] is None:
+                                    grad_weight_accum[unique_name] = w_imp
+                                else:
+                                    grad_weight_accum[unique_name] += w_imp
+                        except Exception as e:
+                            # kernel gradient may fail for some custom layers; ignore per-layer
+                            self.log.debug(f'weight-grad failed for {unique_name}: {e}')
+
+        # finalize accumulators (average)
+        for layer in md_layers:
+            unique_name = f"{layer.name}_{hex(id(layer))}"
+
+            if grad_unit_accum.get(unique_name) is not None and grad_unit_count.get(unique_name, 0) > 0:
+                gunit = grad_unit_accum[unique_name] / float(max(1, grad_unit_count[unique_name]))
+            else:
+                gunit = np.zeros((layer.units,), dtype=np.float32)
+
+            if grad_weight_accum.get(unique_name) is not None:
+                gweight = grad_weight_accum[unique_name] / float(max(1, grad_unit_count[unique_name]))
+            else:
+                gweight = np.zeros_like(layer.kernel.numpy())
+
+            # normalize signals
+            # fisher per-unit exists? fisher returns per-unit or per-layer? we expect per-unit
+            f = fisher.get(unique_name, np.zeros_like(gunit))
+
+            # normalize to zero-mean unit-std to combine
+            def norm(x):
+                x = np.asarray(x, dtype=np.float32)
+                if x.size == 0:
+                    return x
+                x = x - np.median(x)
+                s = np.std(x) + 1e-9
+                return (x / s)
+
+            gunit_n = norm(gunit)
+            f_n = norm(f)
+
+            # combined per-unit importance score (higher = more important)
+            alpha = float(self.config.grad_unit_weight)
+            beta = float(self.config.fisher_weight)
+            unit_score = alpha * gunit_n + beta * f_n
+
+            utilities[unique_name] = unit_score
+            # store weight importance as side-channel in stored structures via attributes on layer if needed
+            # but we return only per-unit utilities for pruning neurons. Connection pruning will use gweight.
+            # temporarily attach to layer for later use
+            setattr(layer, '_last_grad_weight_importance', gweight)
+            setattr(layer, '_last_grad_unit_importance', gunit)
+            setattr(layer, '_last_fisher', f)
+            setattr(layer, '_last_unit_score', unit_score)
+
+            self.log.debug(f'Computed quality utility for {unique_name} (units={unit_score.size})')
+
         return utilities
 
     # ---------------------- candidate generation ---------------------------
     def compute_prune_candidates(self, md_layers, utilities: Dict[str, np.ndarray], prune_fraction: float):
-        self.log.debug('Computing prune candidates for each masked-dense layer')
+        self.log.debug('Computing prune candidates for each masked-dense layer (quality-aware)')
         stored_prune_info = {}
         total_alive_pre = 0
 
@@ -993,18 +1177,32 @@ class EvoCompressor:
             prune_idx = np.zeros((0,), dtype=int)
             n_prune = 0
             if len(alive_idx) > 0:
+                # reverse-sort by quality: low-score = low quality -> prune
                 scores_alive = score[alive_idx]
+                # lower scores mean lower importance (since we normalized around median)
                 n_prune = max(1, int(len(alive_idx) * prune_fraction))
                 prune_pos = np.argsort(scores_alive)[:n_prune]
                 prune_idx = alive_idx[prune_pos]
 
-            # connection pruning candidates (age-weighted importance)
+            # connection pruning candidates using grad-weight importance if available
             W = layer.kernel.numpy()
             conn_age = layer.conn_age.numpy()
-            absW = np.abs(W) * (conn_mask > mask_threshold)
-            max_age = np.max(conn_age) if np.max(conn_age) > 0 else 1.0
-            age_penalty = np.tanh(conn_age / (max_age + 1e-6))
-            score_matrix = absW * (1.0 - 0.5 * age_penalty)
+            # take per-connection importance from attached _last_grad_weight_importance if set
+            gweight = getattr(layer, '_last_grad_weight_importance', None)
+            if gweight is None or gweight.size == 0:
+                # fallback: abs weight with age penalty as before
+                absW = np.abs(W) * (conn_mask > mask_threshold)
+                max_age = np.max(conn_age) if np.max(conn_age) > 0 else 1.0
+                age_penalty = np.tanh(conn_age / (max_age + 1e-6))
+                score_matrix = absW * (1.0 - 0.5 * age_penalty)
+            else:
+                # when grad-weight importance available, lower importance means prune
+                # normalize and combine with age penalty
+                gw = np.abs(gweight) * (conn_mask > mask_threshold)
+                max_age = np.max(conn_age) if np.max(conn_age) > 0 else 1.0
+                age_penalty = np.tanh(conn_age / (max_age + 1e-6))
+                score_matrix = gw * (1.0 - 0.5 * age_penalty)
+
             flat_score = score_matrix.flatten()
             n_rewire = int(flat_score.size * self.config.connection_rewire_fraction)
 
@@ -1020,7 +1218,13 @@ class EvoCompressor:
                 'prune_idx': prune_idx,
                 'n_prune': int(n_prune),
                 'conn_low_pairs': low_pairs,
-                'n_rewire': int(n_rewire)
+                'n_rewire': int(n_rewire),
+                # placeholders for layerwise bookkeeping
+                'val_loss_if_pruned': None,
+                'rel_delta': 0.0,
+                'val_loss_neurons': None,
+                'val_loss_connections': None,
+                'chosen_mode': None,
             }
             self.log.debug(f'Layer {unique_name}: n_prune={n_prune}, n_rewire={int(n_rewire)}')
 
@@ -1030,17 +1234,22 @@ class EvoCompressor:
 
     # ---------------------- scenario evaluation ----------------------------
     def _apply_prune_scenario(self, stored_prune_info, scenario: str):
+        """Apply pruning for the provided stored_prune_info. Scenario must be 'neurons' or 'connections'."""
         md_layers = get_masked_dense_layers(self.model)
         for unique_name, info in stored_prune_info.items():
             layer = next((l for l in md_layers if f"{l.name}_{hex(id(l))}" == unique_name), None)
             if layer is None:
                 continue
-            if scenario in ('neurons', 'both'):
-                if info['prune_idx'].size:
+            if scenario == 'neurons':
+                if info.get('prune_idx', None) is not None and getattr(info['prune_idx'], 'size', 0) > 0:
+                    self.log.debug(f'Applying neuron prune to {unique_name}: n={len(info["prune_idx"])}')
                     layer.prune_units(info['prune_idx'])
-            if scenario in ('connections', 'both'):
-                if info['conn_low_pairs'].size:
+            elif scenario == 'connections':
+                if info.get('conn_low_pairs', None) is not None and getattr(info['conn_low_pairs'], 'size', 0) > 0:
+                    self.log.debug(f'Applying connection prune to {unique_name}: n_pairs={len(info["conn_low_pairs"])})')
                     layer.prune_connections(info['conn_low_pairs'])
+            else:
+                self.log.warning(f'Unknown prune scenario requested: {scenario} (supported: neurons, connections)')
 
     def _evaluate_val(self):
         if isinstance(self.val_ds, tuple) and isinstance(self.val_ds[0], np.ndarray):
@@ -1048,13 +1257,111 @@ class EvoCompressor:
         else:
             return self.model.evaluate(self.val_ds, verbose=0)
 
+    def _apply_prune_layerwise(self, stored_prune_info, baseline_weights, rel_tol):
+        """Sequentially test and accept/reject pruning per-layer.
+
+        Strategy:
+        - Start from baseline weights
+        - Iterate layers ordered by potential compression (descending n_prune)
+        - For each layer: test neuron-only and connection-only pruning separately
+        - Choose the mode with lowest val loss; accept if within rel_tol of current baseline
+        - Record per-layer val_loss and rel_delta and chosen_mode
+        """
+        self.log.info('[LAYERWISE] Starting sequential layer-wise prune evaluation (neurons vs connections)')
+        accepted = []
+        rejected = []
+        # sort layers by n_prune descending - prefer big wins first
+        items = sorted(stored_prune_info.items(), key=lambda kv: kv[1].get('n_prune', 0), reverse=True)
+
+        current_baseline = baseline_weights
+        self.model.set_weights(current_baseline)
+        baseline_val = float(self._evaluate_val()[0])
+        self.log.debug(f'[LAYERWISE] initial baseline_val={baseline_val:.9f}')
+
+        for unique_name, info in items:
+            # skip no-op layers
+            if info.get('n_prune', 0) <= 0 and info.get('n_rewire', 0) <= 0:
+                self.log.debug(f'[LAYERWISE] skipping {unique_name} (no prune candidates)')
+                rejected.append(unique_name)
+                info['val_loss_if_pruned'] = baseline_val
+                info['rel_delta'] = 0.0
+                info['chosen_mode'] = 'none'
+                continue
+
+            # reset to current baseline (cumulative accepted prunes)
+            self.model.set_weights(current_baseline)
+
+            # Test neuron-only pruning
+            self._apply_prune_scenario({unique_name: info}, 'neurons')
+            metrics_neu = self._evaluate_val()
+            v_neu = float(metrics_neu[0])
+            self.log.debug(f'[LAYERWISE] {unique_name} neuron-only val_loss={v_neu:.9f}')
+
+            # revert to baseline before testing connections
+            self.model.set_weights(current_baseline)
+
+            # Test connection-only pruning
+            self._apply_prune_scenario({unique_name: info}, 'connections')
+            metrics_conn = self._evaluate_val()
+            v_conn = float(metrics_conn[0])
+            self.log.debug(f'[LAYERWISE] {unique_name} connection-only val_loss={v_conn:.9f}')
+
+            # decide which mode is better (lower val loss)
+            if v_neu <= v_conn:
+                chosen_mode = 'neurons'
+                chosen_val = v_neu
+            else:
+                chosen_mode = 'connections'
+                chosen_val = v_conn
+
+            delta = (chosen_val - baseline_val) / (abs(baseline_val) + 1e-12)
+
+            info['val_loss_neurons'] = v_neu
+            info['val_loss_connections'] = v_conn
+            info['val_loss_if_pruned'] = chosen_val
+            info['rel_delta'] = delta
+            info['chosen_mode'] = chosen_mode
+
+            # Apply chosen mode for real and accept/reject based on rel_tol
+            self.model.set_weights(current_baseline)
+            self._apply_prune_scenario({unique_name: info}, chosen_mode)
+
+            if chosen_val <= baseline_val * (1.0 + rel_tol):
+                # accept this layer's prune and update baseline to include it
+                accepted.append(unique_name)
+                current_baseline = self.model.get_weights()
+                baseline_val = chosen_val
+                self.log.info(f'[LAYERWISE] ACCEPTED {unique_name} ({chosen_mode}): rel_delta={delta:.9f} -> new baseline_val={baseline_val:.9f}')
+            else:
+                # reject this layer's prune; revert
+                rejected.append(unique_name)
+                self.model.set_weights(current_baseline)
+                self.log.info(f'[LAYERWISE] REJECTED {unique_name} ({chosen_mode}): rel_delta={delta:.9f}')
+
+        # persist decisions for later regrowth logic / debugging
+        self.last_layer_decisions = {k: v for k, v in stored_prune_info.items()}
+        return accepted, rejected, current_baseline, baseline_val
+
     def _search_or_apply_scenarios(self, stored_prune_info, total_alive_pre):
         baseline_weights = self.model.get_weights()
+
+        # if user asked for layerwise pruning, run the sequential layerwise acceptance pass
+        if self.config.layerwise_prune:
+            accepted, rejected, new_baseline, new_val = self._apply_prune_layerwise(stored_prune_info, baseline_weights, self.config.layer_prune_rel_tol)
+            # ensure model is left in the pruned-accepted state
+            self.model.set_weights(new_baseline)
+            pruned_val_loss = float(new_val)
+            best_scenario = 'layerwise'
+            # baseline_weights for decision should be the original (pre-prune) snapshot
+            self.log.info(f'[LAYERWISE] accepted_layers={len(accepted)} rejected_layers={len(rejected)}')
+            return best_scenario, pruned_val_loss, baseline_weights
+
+        # fallback to old behavior (network-level scenarios) but only neurons and connections
         if self.config.prune_search:
-            scenarios = ['neurons', 'connections', 'both']
+            scenarios = ['neurons', 'connections']
             self.log.info(f'[PRUNE-SEARCH] evaluating {scenarios}')
         else:
-            scenarios = ['both']
+            scenarios = ['neurons', 'connections']
 
         scenario_results = {}
         for scen in scenarios:
@@ -1093,11 +1400,18 @@ class EvoCompressor:
         return float(metrics_after[0])
 
     # ---------------------- regrowth --------------------------------------
-    def perform_regrowth(self, stored_prune_info, utilities: Dict[str, np.ndarray]):
+    def perform_regrowth(self, stored_prune_info, utilities: Dict[str, np.ndarray], target_layers: Optional[List[str]] = None):
         md_layers = get_masked_dense_layers(self.model)
-        self.log.debug('Performing regrowth across layers')
+        self.log.debug('Performing regrowth across layers (selective if targets provided)')
+
+        # if target_layers is None -> act on all layers
+        if target_layers is None:
+            target_layers = list(stored_prune_info.keys())
 
         for unique_name, info in stored_prune_info.items():
+            if unique_name not in target_layers:
+                continue
+
             layer = next((l for l in md_layers if f"{l.name}_{hex(id(l))}" == unique_name), None)
             if layer is None:
                 continue
@@ -1259,39 +1573,196 @@ class EvoCompressor:
 # -----------------------------
 # Training + cycles
 # -----------------------------
-def run_experiment(model, train_ds, val_ds, config, mask_thresh_min):
-    log_dir = config['log_dir']
-    chkpt_path = os.path.join(log_dir, 'best_base_model.keras')
-    callbacks = [keras.callbacks.TensorBoard(log_dir=log_dir),
-                 keras.callbacks.ModelCheckpoint(chkpt_path, save_best_only=True, monitor='val_loss'),
-                 keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
-                 keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.95, patience=3, cooldown=10),
-                ]
-    print('\nWarmup training...\n')
-    history = model.fit(train_ds[0], train_ds[1], batch_size=config['batch_size'],
-                        validation_data=(val_ds[0], val_ds[1]), epochs=5,  #config['epochs_per_phase'],
-                        callbacks=callbacks, verbose=2)
-    for cycle in range(config['cycles']):
-        model.summary()
-        cfg = EvoConfig(mask_thresh_min=mask_thresh_min, log_dir='logs', debug=True, prune_search=True)
-        compressor = EvoCompressor(model, val_ds, config=cfg, train_ds=train_ds)        
+def _snapshot_layer_masks(model):
+    """Return a dict of layer_name -> dict of mask arrays for masked layers."""
+    masks = {}
+    for layer in model.layers:
+        # adjust checks to match your masked-dense implementation
+        if hasattr(layer, 'mask') or hasattr(layer, 'conn_mask'):
+            masks[layer.name] = {}
+            if hasattr(layer, 'mask'):
+                try:
+                    masks[layer.name]['mask'] = layer.mask.numpy()
+                except Exception:
+                    masks[layer.name]['mask'] = np.array(layer.mask)  # fallback
+            if hasattr(layer, 'conn_mask'):
+                try:
+                    masks[layer.name]['conn_mask'] = layer.conn_mask.numpy()
+                except Exception:
+                    masks[layer.name]['conn_mask'] = np.array(layer.conn_mask)
+            if hasattr(layer, 'conn_age'):
+                try:
+                    masks[layer.name]['conn_age'] = layer.conn_age.numpy()
+                except Exception:
+                    masks[layer.name]['conn_age'] = np.array(layer.conn_age)
+    return masks
 
-        print(f'\n--- Cycle {cycle + 1}/{config["cycles"]} ---\n')
+def _restore_layer_masks(model, masks_snapshot):
+    """Restore mask arrays back into layers (use assign if tf.Variable)."""
+    for layer in model.layers:
+        if layer.name not in masks_snapshot:
+            continue
+        snap = masks_snapshot[layer.name]
+        if 'mask' in snap and hasattr(layer, 'mask'):
+            try:
+                if isinstance(layer.mask, tf.Variable):
+                    layer.mask.assign(snap['mask'])
+                else:
+                    layer.mask = snap['mask']
+            except Exception:
+                layer.mask = snap['mask']
+        if 'conn_mask' in snap and hasattr(layer, 'conn_mask'):
+            try:
+                if isinstance(layer.conn_mask, tf.Variable):
+                    layer.conn_mask.assign(snap['conn_mask'])
+                else:
+                    layer.conn_mask = snap['conn_mask']
+            except Exception:
+                layer.conn_mask = snap['conn_mask']
+        if 'conn_age' in snap and hasattr(layer, 'conn_age'):
+            try:
+                if isinstance(layer.conn_age, tf.Variable):
+                    layer.conn_age.assign(snap['conn_age'])
+                else:
+                    layer.conn_age = snap['conn_age']
+            except Exception:
+                layer.conn_age = snap['conn_age']
+
+def run_experiment(model, train_ds, val_ds, config, mask_thresh_min):
+    os.makedirs(config.get('log_dir', './logs'), exist_ok=True)
+    log_dir = config['log_dir']
+
+    # cycle-level early stopping config (use relative threshold by default)
+    cycle_patience = int(config.get('cycle_patience', 3))
+    cycle_min_rel = float(config.get('cycle_min_rel', 1e-3))   # relative improvement (default 0.1%)
+    cycle_min_abs = float(config.get('cycle_min_abs', 1e-12))  # absolute fallback
+    cycle_monitor = config.get('cycle_monitor', 'val_loss_final')
+    save_best_cycle = bool(config.get('save_best_cycle_model', True))
+
+    # callbacks for warmup
+    chkpt_path = os.path.join(log_dir, 'best_base_model.keras')
+    callbacks = [
+        keras.callbacks.TensorBoard(log_dir=log_dir),
+        keras.callbacks.ModelCheckpoint(chkpt_path, save_best_only=True, monitor='val_loss'),
+        keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1),
+        keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.95, patience=3, cooldown=10),
+    ]
+    print('\nWarmup training...\n')
+    history = model.fit(
+        train_ds[0], train_ds[1],
+        batch_size=config['batch_size'],
+        validation_data=(val_ds[0], val_ds[1]),
+        epochs=5,
+        callbacks=callbacks,
+        verbose=2
+    )
+
+    best_cycle_metric = np.inf
+    best_cycle_idx = -1
+    best_cycle_weights = None
+    best_cycle_masks = None
+    best_cycle_model_path = os.path.join(log_dir, 'best_cycle_overall.keras')
+    cycles_no_improve = 0
+
+    total_cycles = int(config.get('cycles', 10))
+    for cycle in range(total_cycles):
+        # create compressor with fresh config per-cycle if desired
+        cfg = EvoConfig(mask_thresh_min=mask_thresh_min, log_dir=log_dir, debug=True, prune_search=True)
+        compressor = EvoCompressor(model, val_ds, config=cfg, train_ds=train_ds)
+
+        print(f'\n--- Cycle {cycle + 1}/{total_cycles} ---\n')
         chkpt_path = os.path.join(log_dir, f'best_cycle_{cycle+1}_model.keras')
-        callbacks = [keras.callbacks.TensorBoard(log_dir=log_dir),
-                     keras.callbacks.ModelCheckpoint(chkpt_path, save_best_only=True, monitor='val_loss'),
-                     keras.callbacks.EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True, verbose=1),
-                     keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.99, patience=3, cooldown=0, min_lr=5e-6),
-                    ]
-        history = model.fit(train_ds[0], train_ds[1], batch_size=config['batch_size'],
-                            validation_data=(val_ds[0], val_ds[1]), epochs=config['epochs_per_phase'],
-                            callbacks=callbacks, verbose=2)
+        callbacks = [
+            keras.callbacks.TensorBoard(log_dir=log_dir),
+            keras.callbacks.ModelCheckpoint(chkpt_path, save_best_only=True, monitor='val_loss'),
+            keras.callbacks.EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True, verbose=1),
+            keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.99, patience=3, cooldown=0, min_lr=5e-6),
+        ]
+        # train -> history
+        history = model.fit(
+            train_ds[0], train_ds[1],
+            batch_size=config['batch_size'],
+            validation_data=(val_ds[0], val_ds[1]),
+            epochs=config['epochs_per_phase'],
+            callbacks=[  # your callbacks...
+            ],
+            verbose=2
+        )
+
         train_loss = float(history.history['loss'][-1])
         val_loss = float(history.history['val_loss'][-1])
         summary, mask_thresh_min = compressor.evaluate_and_compress(train_loss=train_loss, val_loss=val_loss)
-        print('\nCompressor summary:', summary,'\n')
-    model.save(os.path.join(log_dir, 'final_model.keras'))
+
+        # pick metric
+        if cycle_monitor == 'val_loss_final':
+            current_metric = float(summary.get('val_loss_final', np.inf))
+        elif cycle_monitor == 'pruned_val_loss':
+            current_metric = float(summary.get('pruned_val_loss', np.inf))
+        elif cycle_monitor == 'val_loss':
+            current_metric = val_loss
+        else:
+            current_metric = float(summary.get('val_loss_final', np.inf))
+
+        # RELATIVE improvement check:
+        if best_cycle_metric == np.inf:
+            improved = True
+        else:
+            rel_improv = (best_cycle_metric - current_metric) / (abs(best_cycle_metric) + 1e-12)
+            abs_improv = best_cycle_metric - current_metric
+            improved = (rel_improv > cycle_min_rel) or (abs_improv > cycle_min_abs)
+
+        if improved:
+            best_cycle_metric = current_metric
+            best_cycle_idx = cycle
+            # snapshot both weights and masks
+            best_cycle_weights = [w.copy() for w in model.get_weights()]
+            best_cycle_masks = _snapshot_layer_masks(model)
+            cycles_no_improve = 0
+            if save_best_cycle:
+                try:
+                    model.save(best_cycle_model_path, overwrite=True, include_optimizer=True)
+                except Exception as e:
+                    print(f'Warning: failed to save full model to disk: {e}')
+            print(f'[CYCLE-ES] New best cycle #{cycle+1}: {cycle_monitor}={current_metric:.6g}')
+        else:
+            cycles_no_improve += 1
+            print(f'[CYCLE-ES] No improvement on cycle {cycle+1} ({cycle_monitor}={current_metric:.6g}); '
+                  f'no_improve_count={cycles_no_improve}/{cycle_patience}')
+
+        if cycles_no_improve >= cycle_patience:
+            print(f'[CYCLE-ES] Early stopping after {cycle+1} cycles. Restoring best cycle #{best_cycle_idx+1} (metric={best_cycle_metric:.6g})')
+            # Prefer full-disk load (best for custom-layer state); fallback to in-memory masks+weights
+            restored = False
+            if save_best_cycle and os.path.exists(best_cycle_model_path):
+                try:
+                    loaded = keras.models.load_model(best_cycle_model_path, compile=False)
+                    # Replace model weights & attributes in-place if feasible:
+                    model.set_weights(loaded.get_weights())
+                    _restore_layer_masks(model, _snapshot_layer_masks(loaded))
+                    restored = True
+                    print('[CYCLE-ES] Restored model state from disk saved .keras file.')
+                except Exception as e:
+                    print(f'[CYCLE-ES] Warning: full-model disk restore failed ({e}); will try in-memory masks+weights.')
+
+            if not restored and best_cycle_weights is not None:
+                model.set_weights(best_cycle_weights)
+                if best_cycle_masks is not None:
+                    _restore_layer_masks(model, best_cycle_masks)
+                print('[CYCLE-ES] Restored best weights + mask snapshot from memory.')
+            break
+
+    # if we exhausted cycles, restore best if exists
+    if cycles_no_improve < cycle_patience and best_cycle_weights is not None:
+        print(f'[CYCLE-ES] Completed all cycles. Restoring best cycle #{best_cycle_idx+1}.')
+        model.set_weights(best_cycle_weights)
+        if best_cycle_masks is not None:
+            _restore_layer_masks(model, best_cycle_masks)
+
+    # final save
+    model.save(os.path.join(log_dir, 'final_model.keras'), overwrite=True, include_optimizer=True)
     return model, compressor
+
+
 
 if __name__ == '__main__':
     trained_model, compressor = run_experiment(model, train_ds, val_ds, CONFIG, MASK_THRESH_MIN)
