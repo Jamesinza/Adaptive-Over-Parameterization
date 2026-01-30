@@ -75,9 +75,9 @@ CONFIG = {
     'train_size': len(train_data),
     'val_size': len(val_data),
     'batch_size': batch_size,
-    'warm_up_epochs': 1,
-    'epochs_per_phase': 100,
-    'cycles': 100,
+    'warm_up_epochs': 100,
+    'epochs_per_phase': 1000,
+    'cycles': 1000,
     'regrow_finetune_steps': 3,
     'mask_thresh_min': 0.1,
     'mask_thresh_multi': 0.05,
@@ -176,6 +176,16 @@ class EvoConfig:
     crec_history_window = 8
     crec_max_delta_per_step = 0.05
 
+    # Controller (online neural subcontroller) defaults
+    use_controller = True
+    controller_lr = 1e-5
+    controller_hidden_units = (8, 4)
+    controller_ent_coef = 1e-3
+    controller_max_delta_regrow = 0.05
+    controller_max_delta_comp = 0.2
+    controller_baseline_decay = 0.99
+    
+
 # ---------------------------------------------------------------------------
 # Pareto logger
 # ---------------------------------------------------------------------------
@@ -188,6 +198,119 @@ class ParetoLogger:
 
     def last(self):
         return self.points[-1] if self.points else None
+
+
+# ---------------------------
+# Online neural subcontroller (tiny policy network)
+# ---------------------------
+class OnlineNeuralSubcontroller(tf.keras.Model):
+    """
+    Stochastic Gaussian policy returning two actions:
+      - delta_regrow (applied to regrow_fraction)
+      - delta_compression (applied to compression_tradeoff)
+    Trained online with REINFORCE (policy gradient) using a running baseline (EMA).
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        hidden_units: Tuple[int, ...] = (64, 32),
+        lr: float = 1e-4,
+        ent_coef: float = 1e-3,
+        max_delta_regrow: float = 0.05,
+        max_delta_comp: float = 0.2,
+        baseline_decay: float = 0.99,
+        name: str = "online_subcontroller",
+    ):
+        super().__init__(name=name)
+        self.max_delta_regrow = float(max_delta_regrow)
+        self.max_delta_comp = float(max_delta_comp)
+        self.ent_coef = float(ent_coef)
+        self.baseline_decay = float(baseline_decay)
+
+        # small MLP -> means
+        self._mlp = tf.keras.Sequential(name=f"{name}_mlp")
+        for i, u in enumerate(hidden_units):
+            self._mlp.add(tf.keras.layers.Dense(u, activation="elu", name=f"dense_{i}"))
+        self._mean_head = tf.keras.layers.Dense(2, activation=None, name="mean_head")
+        # learnable logstd
+        init_logstd = -3.0
+        self.logstd = tf.Variable(tf.ones((2,)) * init_logstd, trainable=True, name="logstd")
+
+        self.opt = tf.keras.optimizers.AdamW(learning_rate=lr)
+
+        # running baseline for advantage
+        self.reward_baseline = 0.0
+        self._baseline_initialized = False
+
+        # last stored sampling info for online update
+        self._last_state = None
+        self._last_action = None
+        self._last_logp = None
+
+    def call(self, state: tf.Tensor):
+        x = tf.convert_to_tensor(state, dtype=tf.float32)
+        if len(x.shape) == 1:
+            x = tf.expand_dims(x, 0)
+        h = self._mlp(x)
+        mean = self._mean_head(h)  # (1,2)
+        std = tf.exp(self.logstd)  # (2,)
+        return tf.squeeze(mean, axis=0), std  # (2,), (2,)
+
+    def sample_action(self, state: np.ndarray):
+        mean, std = self.call(state)
+        mean_np = mean.numpy()
+        std_np = std.numpy()
+        eps = np.random.randn(*mean_np.shape).astype(np.float32)
+        raw_action = mean_np + eps * std_np
+        var = std_np ** 2 + 1e-12
+        logp = -0.5 * np.sum(((raw_action - mean_np) ** 2) / var + np.log(2 * np.pi * var))
+        # bound and scale via tanh
+        a0 = np.tanh(raw_action[0]) * self.max_delta_regrow
+        a1 = np.tanh(raw_action[1]) * self.max_delta_comp
+        action = np.array([a0, a1], dtype=np.float32)
+        self._last_state = np.asarray(state, dtype=np.float32)
+        self._last_action = raw_action.astype(np.float32)
+        self._last_logp = float(logp)
+        return action, float(logp), mean_np, std_np
+
+    def learn_from_reward(self, reward: float, entropy_bonus: float = None):
+        if self._last_state is None:
+            return None, None
+
+        if not self._baseline_initialized:
+            self.reward_baseline = float(reward)
+            self._baseline_initialized = True
+
+        advantage = float(reward) - float(self.reward_baseline)
+        # ema update
+        self.reward_baseline = float(self.baseline_decay * self.reward_baseline + (1.0 - self.baseline_decay) * float(reward))
+
+        raw_action = tf.convert_to_tensor(self._last_action, dtype=tf.float32)
+        state = tf.convert_to_tensor(self._last_state[None, :], dtype=tf.float32)  # (1,dim)
+
+        with tf.GradientTape() as tape:
+            h = self._mlp(state)
+            mean = self._mean_head(h)[0]
+            std = tf.exp(self.logstd)
+            var = std ** 2 + 1e-12
+            log_prob = -0.5 * tf.reduce_sum(((raw_action - mean) ** 2) / var + tf.math.log(2.0 * np.pi * var))
+            loss_pg = - (advantage) * log_prob
+            if entropy_bonus is None:
+                entropy_bonus = self.ent_coef
+            entropy = 0.5 * tf.reduce_sum(tf.math.log(2.0 * np.pi * np.e * var))
+            loss = loss_pg - entropy_bonus * entropy
+
+        grads = tape.gradient(loss, self.trainable_variables)
+        grads_and_vars = [(g, v) for g, v in zip(grads, self.trainable_variables) if g is not None]
+        if grads_and_vars:
+            self.opt.apply_gradients(grads_and_vars)
+
+        self._last_state = None
+        self._last_action = None
+        self._last_logp = None
+
+        return float(advantage), float(loss.numpy())
 
 
 # ------------------------------------------------------
@@ -279,81 +402,77 @@ class NeuroAdaptiveCREC:
     # Core adaptive update
     # ------------------------------------------------------
     def update(self, fisher_metric, val_delta, masks):
+        """Update regrow_fraction and compression_tradeoff adaptively.
+        `masks` can be either a list of mask arrays (as before) or a list of per-layer
+        aggregated entropy-like scalars in [0,1]. We accept both for backwards compatibility.
         """
-        Update regrow_fraction and compression_tradeoff adaptively.
-        - clamps per-step delta to avoid single-step explosions.
-        - uses normalized entropy in [0,1].
-        """
-        # compute per-layer mask entropy (normalized)
-        mask_entropies = [self._mask_entropy(m) for m in masks if getattr(m, 'size', 0) > 0]
-        mean_entropy = float(np.mean(mask_entropies)) if len(mask_entropies) > 0 else 0.0
-
-        # calibrate targets first (uses rolling history)
+        # accept scalars (already normalized entropy in [0,1]) or arrays
+        mask_entropies = []
+        for m in masks:
+            if m is None:
+                continue
+            # scalar path: assumed to be pre-computed entropy in [0,1]
+            if np.isscalar(m):
+                try:
+                    mask_entropies.append(float(m))
+                except Exception:
+                    mask_entropies.append(0.0)
+                continue
+            # array-like path: compute neuron-level alive fraction and entropy normalized by ln(2)
+            try:
+                arr = np.asarray(m)
+                if arr.size == 0:
+                    mask_entropies.append(0.0)
+                    continue
+                p = float(np.mean(arr))
+                if p <= 0.0 or p >= 1.0:
+                    mask_entropies.append(0.0)
+                else:
+                    mask_entropies.append((-(p * np.log(p) + (1 - p) * np.log(1 - p))) / np.log(2.0))
+            except Exception:
+                mask_entropies.append(0.0)
+    
+        mean_entropy = np.mean(mask_entropies) if len(mask_entropies) > 0 else 0.0
+    
+        # --- self-calibrate targets before using them ---
         self.calibrate_targets(fisher_metric, mask_entropies)
-
-        # Compute raw terms
-        # fisher_term: positive if target > observed (i.e. want to regrow to increase fisher)
-        fisher_term = (float(self.fisher_target) - float(fisher_metric)) * float(self.fisher_k)
-
-        # val_term: we expect val_delta = previous_val - current_val so positive => improvement
-        # negative val_delta (performance drop) should encourage regrow (so invert sign)
-        # keep sign convention: more negative val_delta (worse now) => positive regrow encouragement
-        val_term = (-float(val_delta)) * float(self.val_k)
-
-        # entropy_term: normalized difference in [ -1, 1 ] scaled by entropy_k
-        # use normalized entropy scale (both target and observed in [0,1])
-        entropy_diff = float(self.entropy_target_dynamic) - float(mean_entropy)
-        entropy_term = entropy_diff * float(self.entropy_k)
-
-        raw_delta = fisher_term + val_term + entropy_term
-
-        # --- safety guards ---
-        # limit how much the regrow_fraction can move in one call
-        max_step = min(self.max_delta_per_step, 0.5 * float(self.max_regrow_fraction))
-        if max_step is None:
-            # default conservative step: 10% absolute change
-            max_step = 0.1
-        # clip raw_delta to [-max_step, max_step]
-        clipped_delta = float(np.clip(raw_delta, -abs(max_step), abs(max_step)))
-
-        # compute new raw regrow, clip by configured max_regrow_fraction
-        new_r = float(np.clip(self.regrow_fraction + clipped_delta, 0.0, float(self.max_regrow_fraction)))
-
-        # smoothing (momentum) and final clip
-        self.smoothed_regrow = float(self.momentum * self.smoothed_regrow + (1.0 - self.momentum) * new_r)
-        # ensure final regrow_fraction respects bounds
-        self.regrow_fraction = float(np.clip(self.smoothed_regrow, 0.0, float(self.max_regrow_fraction)))
-
-        # update compression tradeoff with small step clipping
-        compression_adjust = (
-            (float(fisher_metric) - float(self.fisher_target)) * 0.05
-            - (mean_entropy - float(self.entropy_target_dynamic)) * 0.1
+    
+        # Compute deviations
+        fisher_term = (self.fisher_target - fisher_metric) * self.fisher_k
+        val_term = -val_delta * self.val_k
+        entropy_term = (self.entropy_target_dynamic - mean_entropy) * self.entropy_k
+    
+        delta = fisher_term + val_term + entropy_term
+    
+        # Update regrow fraction with smoothing
+        new_r = np.clip(self.regrow_fraction + delta, 0.0, self.max_regrow_fraction)
+        self.smoothed_regrow = (
+            self.momentum * self.smoothed_regrow + (1 - self.momentum) * new_r
         )
-        # clip compression adjust per step
-        compression_adjust = float(np.clip(compression_adjust, -0.2, 0.2))
-        self.compression_tradeoff = float(np.clip(self.compression_tradeoff + compression_adjust, 0.1, 10.0))
-
-        # Save val metric history
-        self.val_history.append(float(val_delta))
+        self.regrow_fraction = float(self.smoothed_regrow)
+    
+        # --- Update compression_tradeoff ---
+        compression_adjust = (
+            (fisher_metric - self.fisher_target) * 0.05
+            - (mean_entropy - self.entropy_target_dynamic) * 0.1
+        )
+        self.compression_tradeoff = np.clip(
+            self.compression_tradeoff + compression_adjust, 0.1, 10.0
+        )
+    
+        # Save val metric
+        self.val_history.append(val_delta)
         if len(self.val_history) > self.history_window:
             self.val_history.pop(0)
-
-        # debug-level return includes components so logs make cause obvious
+    
         return {
             "regrow_fraction": self.regrow_fraction,
             "compression_tradeoff": self.compression_tradeoff,
             "fisher_target": self.fisher_target,
             "entropy_target": self.entropy_target_dynamic,
             "mean_entropy": mean_entropy,
-            "components": {
-                "fisher_term": fisher_term,
-                "val_term": val_term,
-                "entropy_term": entropy_term,
-                "raw_delta": raw_delta,
-                "clipped_delta": clipped_delta,
-                "new_r_pre_smooth": new_r,
-            },
         }
+
 
     # ------------------------------------------------------
     # Summary
@@ -408,6 +527,22 @@ class EvoCompressor:
             history_window=getattr(self.config, 'crec_history_window', 20),
         )
 
+        # optional online controller for NeuroAdaptiveCREC
+        if getattr(self.config, 'use_controller', False):
+            state_dim = 8  # fisher, mean_layer_entropy, val_delta, crec_regrow, crec_comp, mean_util_var, mean_conn_density, prune_fraction
+            self.controller = OnlineNeuralSubcontroller(
+                state_dim=state_dim,
+                hidden_units=getattr(self.config, 'controller_hidden_units', (64, 32)),
+                lr=getattr(self.config, 'controller_lr', 1e-4),
+                ent_coef=getattr(self.config, 'controller_ent_coef', 1e-3),
+                max_delta_regrow=getattr(self.config, 'controller_max_delta_regrow', 0.05),
+                max_delta_comp=getattr(self.config, 'controller_max_delta_comp', 0.2),
+                baseline_decay=getattr(self.config, 'controller_baseline_decay', 0.99),
+            )
+        else:
+            self.controller = None
+        self._controller_last = None
+
         # track last observed val loss for delta computations
         self.last_val_loss: Optional[float] = None
 
@@ -424,8 +559,6 @@ class EvoCompressor:
             self.logger.addHandler(ch)
         self.log = self.logger
 
-    # The rest of EvoCompressor methods are assumed present unchanged except where we add CREC hooks
-
     # ------------ hook points inserted into evaluate_and_compress ------------
     def evaluate_and_compress(self, train_loss: Optional[float] = None, val_loss: Optional[float] = None, do_regrow: bool = True) -> Tuple[Dict[str, Any], float]:
         self.log.info('Starting evaluate_and_compress cycle (CREC-enabled)')
@@ -435,50 +568,156 @@ class EvoCompressor:
         # compute utilities (unchanged behavior)
         utilities = self.compute_utilities(md_layers)
 
-        # --- CREC: derive scalar fisher metric and mask entropies from layer objects ---
+        # --- CREC: derive scalar fisher metric and richer mask/conn entropies from layer objects ---
         fisher_vals = []
-        mask_entropies = []
+        layer_entropy_metrics = []   # aggregated per-layer entropy-like signals (normalized 0..1)
+        debug_layer_info = []
+        
         for l in md_layers:
+            # fisher (mean abs)
             f = getattr(l, '_last_fisher', None)
             if f is None or getattr(f, 'size', 0) == 0:
                 continue
             fisher_vals.append(float(np.mean(np.abs(f))))
-            m = l.mask.numpy()
-            print(f'\nm: {m}\n')
-            # compute simple entropy of mask activation fraction
-            p = float(np.mean(m > 0.5)) if m.size else 0.0
-            print(f'\np: {p}\n')
-            if p > 0 and p < 1.0:
-                mask_entropies.append(-(p * np.log(p) + (1 - p) * np.log(1 - p)))
+        
+            # neuron-level alive fraction (one value per output neuron mask)
+            m = l.mask.numpy() if hasattr(l, 'mask') else np.array([])
+            p_neuron = float(np.mean(m)) if m.size else 0.0   # already in [0,1]
+        
+            # connection-level alive fraction (conn_mask shape = (in_dim, out_dim))
+            conn = l.conn_mask.numpy() if hasattr(l, 'conn_mask') else np.array([])
+            p_conn = float(np.mean(conn)) if conn.size else 0.0
+        
+            # normalized entropy helper (divided by ln(2) to map max->1.0)
+            def _norm_entropy(p):
+                if p <= 0.0 or p >= 1.0:
+                    return 0.0
+                return (-(p * np.log(p) + (1.0 - p) * np.log(1.0 - p))) / np.log(2.0)
+        
+            ent_neuron = _norm_entropy(p_neuron)   # 0..1
+            ent_conn = _norm_entropy(p_conn)       # 0..1
+        
+            # utility variance signal (use EMA unit score if available)
+            util = getattr(l, '_ema_unit_score', None)
+            if util is None or util.size == 0:
+                util_var = 0.0
             else:
-                mask_entropies.append(0.0)
-
-        print(f'\nfisher_vals: {fisher_vals}\n')
-        print(f'\nmask_entropies: {mask_entropies}\n')
-
+                util_arr = np.asarray(util, dtype=np.float32)
+                util_var = float(np.clip(np.var(util_arr) / (np.mean(np.abs(util_arr)) + 1e-9), 0.0, 1.0))
+        
+            # aggregate into a single per-layer entropy-like metric
+            layer_entropy = 0.6 * ent_conn + 0.3 * ent_neuron + 0.1 * util_var
+            layer_entropy = float(np.clip(layer_entropy, 0.0, 1.0))
+        
+            layer_entropy_metrics.append(layer_entropy)
+            debug_layer_info.append({
+                'name': f"{l.name}_{hex(id(l))}",
+                'p_neuron': p_neuron,
+                'p_conn': p_conn,
+                'ent_neuron': ent_neuron,
+                'ent_conn': ent_conn,
+                'util_var': util_var,
+                'agg_entropy': layer_entropy,
+                'fisher_mean_abs': float(np.mean(np.abs(f))),
+            })
+        
+        # scalar fisher metric: median of per-layer mean-abs fisher (robust)
         fisher_metric = float(np.median(fisher_vals)) if fisher_vals else 0.0
 
         # baseline val loss
-        baseline_val_loss = self._obtain_baseline_loss(val_loss)
-
+        baseline_val_loss = self._obtain_baseline_loss(val_loss)        
+        
         # compute val_delta relative to last observed val
         if self.last_val_loss is None:
             val_delta = 0.0
         else:
             # positive = improvement (previous -> current lowered loss)
             val_delta = float(self.last_val_loss - baseline_val_loss)
-
-        # update CREC with current signals
+        
+        # Pass aggregated per-layer scalars to CREC (CREC.update handles scalar entropies)
         try:
-            crec_info = self.crec.update(fisher_metric, val_delta, [l.mask.numpy() for l in md_layers])
+            crec_info = self.crec.update(fisher_metric, val_delta, layer_entropy_metrics)
             self.log.debug(f'CREC update: {crec_info}')
         except Exception as e:
             self.log.warning(f'CREC update failed: {e}')
             crec_info = self.crec.summary()
+        
+        # helpful debug printing
+        mean_entropy = float(np.mean(layer_entropy_metrics)) if layer_entropy_metrics else 0.0
+        self.log.debug(f'CREC input: fisher_metric={fisher_metric:.3e}, mean_layer_entropy={mean_entropy:.4f}')
+        for info in debug_layer_info:
+            self.log.debug(
+                f"layer={info['name']} p_neuron={info['p_neuron']:.3f} p_conn={info['p_conn']:.3f} "
+                f"ent_conn={info['ent_conn']:.3f} ent_neuron={info['ent_neuron']:.3f} util_var={info['util_var']:.3f} agg={info['agg_entropy']:.3f}"
+            )
 
         # decide dynamic prune fraction (CREC may influence future regrow)
         prune_fraction = self._compute_dynamic_prune_fraction(train_loss, val_loss)
         self.log.info(f'Computed prune_fraction={prune_fraction:.4f}')
+
+        # controller integration: build compact state and let controller propose small deltas
+        # first fetch CREC's suggestions
+        crec_regrow = float(crec_info.get('regrow_fraction', self.crec.regrow_fraction))
+        crec_comp = float(crec_info.get('compression_tradeoff', self.crec.compression_tradeoff))
+
+        # compute a couple of extra signals for the state
+        mean_util_var = 0.0
+        mean_conn_density = 1.0
+        util_vars = []
+        conn_ds = []
+        for l in md_layers:
+            util = getattr(l, '_ema_unit_score', None)
+            if util is not None and getattr(util, 'size', 0) > 0:
+                util_vars.append(float(np.var(np.asarray(util, dtype=np.float32))))
+            cm = getattr(l, 'conn_mask', None)
+            if cm is not None:
+                try:
+                    conn_ds.append(float(np.mean(cm.numpy())))
+                except Exception:
+                    pass
+        if util_vars:
+            mean_util_var = float(np.mean(util_vars))
+        if conn_ds:
+            mean_conn_density = float(np.mean(conn_ds))
+
+        prune_frac_for_state = float(prune_fraction) if 'prune_fraction' in locals() else 0.0
+
+        state = np.array([
+            fisher_metric,
+            mean_entropy,
+            val_delta,
+            crec_regrow,
+            crec_comp,
+            mean_util_var,
+            mean_conn_density,
+            prune_frac_for_state,
+        ], dtype=np.float32)
+
+        # sample controller action (if controller enabled)
+        if getattr(self, 'controller', None) is not None:
+            action, logp, mean, std = self.controller.sample_action(state)
+            # action = [delta_regrow, delta_comp]
+            applied_regrow = float(np.clip(crec_regrow + float(action[0]), 0.0, self.crec.max_regrow_fraction))
+            applied_comp = float(np.clip(crec_comp + float(action[1]), 0.1, 10.0))
+
+            # stash overrides and original values so we can restore and learn later
+            self._controller_last = {
+                'state': state,
+                'action': action,
+                'logp': logp,
+                'crec_regrow': crec_regrow,
+                'crec_comp': crec_comp,
+                'applied_regrow': applied_regrow,
+                'applied_comp': applied_comp,
+            }
+
+            # apply overrides for the downstream regrow decision logic
+            self._controller_old_regrow = getattr(self.config, 'regrow_fraction', 0.05)
+            self._controller_old_comp = getattr(self.crec, 'compression_tradeoff', self.config.compression_tradeoff)
+            self.config.regrow_fraction = applied_regrow
+            self.crec.compression_tradeoff = applied_comp
+        else:
+            self._controller_last = None
 
         # compute prune candidates
         stored_prune_info, total_alive_pre, mask_thresh_min = self.compute_prune_candidates(md_layers, utilities, prune_fraction)
@@ -575,6 +814,40 @@ class EvoCompressor:
             'crec': crec_summary,
         }
         self.history.append(summary)
+
+        # ----- Controller learning (online) -----
+        if getattr(self, 'controller', None) is not None and getattr(self, '_controller_last', None) is not None:
+            try:
+                baseline_alive = int(total_alive_pre) if 'total_alive_pre' in locals() else int(0)
+                total_alive_now = int(total_alive_now) if 'total_alive_now' in locals() else int(sum(r['alive_neurons'] for r in df_rows))
+                compression_gain = (baseline_alive - total_alive_now) / (baseline_alive + 1e-12)
+
+                # normalized val improvement (positive is better)
+                val_improve_norm = (baseline_val_loss - val_loss_final) / (abs(baseline_val_loss) + 1e-12)
+
+                # reward shaping: you can tune weights w_val and w_comp
+                w_val = 1.0
+                w_comp = 0.5
+                reward = float(w_val * val_improve_norm + w_comp * compression_gain)
+
+                adv, loss = self.controller.learn_from_reward(reward)
+                self.log.debug(f'Controller learn: adv={adv} loss={loss} reward={reward:.6g}')
+
+            except Exception as e:
+                self.log.warning(f'Controller learning failed: {e}')
+            finally:
+                # restore config/CREC original values so next cycle starts clean
+                if hasattr(self, '_controller_old_regrow'):
+                    try:
+                        self.config.regrow_fraction = self._controller_old_regrow
+                    except Exception:
+                        pass
+                if hasattr(self, '_controller_old_comp'):
+                    try:
+                        self.crec.compression_tradeoff = self._controller_old_comp
+                    except Exception:
+                        pass
+                self._controller_last = None
 
         # update last_val_loss for next cycle
         self.last_val_loss = val_loss_final
@@ -960,11 +1233,6 @@ class EvoCompressor:
                 s3 = np.std(arra) + 1e-9
                 a_n = (arra / s3)             
 
-            # print(f'\nUtility results for {unique_name}:')
-            # print(f'\nFisher: \n{f}')
-            # print(f'\nAblation: \n{a}')
-            # print(f'\nGradUnit: \n{gunit}\n')
-            # utilities[unique_name] = unit_score
             setattr(layer, '_last_grad_weight_importance', gweight)
             setattr(layer, '_last_grad_unit_importance', gunit)
             setattr(layer, '_last_fisher', f)
@@ -1082,24 +1350,38 @@ class EvoCompressor:
         baseline_weights = self.model.get_weights()
         return stored_prune_info, int(total_alive_pre), mask_thresh_min
 
-    # ---------------------- scenario evaluation ----------------------------
     def _apply_prune_scenario(self, layer, stored_prune_info, scenario: str):
-        """Apply pruning for the provided stored_prune_info. Scenario must be 'neurons' or 'connections'."""
-        # md_layers = get_masked_dense_layers(self.model)
+        """
+        Apply pruning scenario. If 'layer' is provided, expects stored_prune_info to contain
+        only that layer's entry. If layer is None, we will locate the layer object for each
+        stored_prune_info entry.
+        """
+        md_layers = get_masked_dense_layers(self.model)
+    
         for unique_name, info in stored_prune_info.items():
-            # layer = next((l for l in md_layers if f"{l.name}_{hex(id(l))}" == unique_name), None)
+            # locate layer object if not given
             if layer is None:
+                layer_obj = next((l for l in md_layers if f"{l.name}_{hex(id(l))}" == unique_name), None)
+            else:
+                # caller provided a specific layer object to operate on
+                # ensure it's the same unique_name (caller responsibility)
+                layer_obj = layer
+    
+            if layer_obj is None:
+                self.log.debug(f'No layer object found for {unique_name}; skipping')
                 continue
+    
             if scenario == 'neurons':
                 if info.get('prune_idx', None) is not None and getattr(info['prune_idx'], 'size', 0) > 0:
                     self.log.debug(f'Applying neuron prune to {unique_name}: n={len(info["prune_idx"])}')
-                    layer.prune_units(info['prune_idx'])
+                    layer_obj.prune_units(info['prune_idx'])
             elif scenario == 'connections':
                 if info.get('conn_low_pairs', None) is not None and getattr(info['conn_low_pairs'], 'size', 0) > 0:
                     self.log.debug(f'Applying connection prune to {unique_name}: n_pairs={len(info["conn_low_pairs"])}')
-                    layer.prune_connections(info['conn_low_pairs'])
+                    layer_obj.prune_connections(info['conn_low_pairs'])
             else:
-                self.log.warning(f'\nUnknown prune scenario requested: {scenario} (supported: neurons, connections)\n')
+                self.log.warning(f'Unknown prune scenario requested: {scenario} (supported: neurons, connections)')
+    
 
     def _evaluate_val(self):
         if isinstance(self.val_ds, tuple) and isinstance(self.val_ds[0], np.ndarray):
@@ -1242,7 +1524,7 @@ class EvoCompressor:
         scenario_results = {}
         for scen in scenarios:
             self.model.set_weights(baseline_weights)
-            self._apply_prune_scenario(stored_prune_info, scen)
+            self._apply_prune_scenario(None, stored_prune_info, scen)
             metrics = self._evaluate_val()
             scenario_val_loss = float(metrics[0])
             scenario_results[scen] = {'val_loss': scenario_val_loss}
@@ -1253,7 +1535,7 @@ class EvoCompressor:
 
         # ensure the model is left pruned according to best scenario
         self.model.set_weights(baseline_weights)
-        self._apply_prune_scenario(layer=None, stored_prune_info=stored_prune_info, scenario=best_scenario)
+        self._apply_prune_scenario(None, stored_prune_info, best_scenario)
 
         return best_scenario, pruned_val_loss, baseline_weights
 
@@ -1300,7 +1582,7 @@ class EvoCompressor:
         opt = getattr(self.model, 'optimizer', None)
         if opt is None:
             # fallback optimizer (no stateful accumulators for main opt)
-            opt = keras.optimizers.AdamW(learning_rate=1e-3)
+            opt = keras.optimizers.AdamW(learning_rate=1e-4)
     
         vars_to_update = [v for v in layer.trainable_variables if v.trainable]
         if not vars_to_update:
@@ -1453,7 +1735,7 @@ class EvoCompressor:
                             init_val = row_mean + rng.normal(scale=self.config.regrow_reinit_std)
                             k_arr[i, j] = init_val
                             conn_age[i, j] = 0.0
-                        layer.conn_mask.assign(layer.conn_mask.numpy())  # ensure shape consistent
+                        # layer.conn_mask.assign(layer.conn_mask.numpy())  # ensure shape consistent
                         layer.conn_mask.assign(np.where(layer.conn_mask.numpy() < 0.5, layer.conn_mask.numpy(), layer.conn_mask.numpy()))
                         # apply changes
                         layer.regrow_connections(regrow_pairs)
@@ -1652,10 +1934,7 @@ class TransformerBlock(keras.layers.Layer):
         self.ff_dim = int(ff_dim)
 
         # build sublayers in __init__ is fine (they will be built later on first call)
-        self.att = keras.layers.MultiHeadAttention(
-            num_heads=self.num_heads,
-            key_dim=max(1, self.d_model // max(1, self.num_heads))
-        )
+        self.att = MaskedMultiHeadAttention(d_model=self.d_model, num_heads=self.num_heads, name='masked_mha')
         self.norm1 = keras.layers.LayerNormalization()
         self.norm2 = keras.layers.LayerNormalization()
         self.ffn_dense1 = MaskedDense(self.ff_dim, activation='gelu', name='ffn_dense1')
@@ -1687,6 +1966,100 @@ class TransformerBlock(keras.layers.Layer):
     def from_config(cls, config):
         # Keras will call this during deserialization
         return cls(**config)
+
+
+# -----------------------------
+# Custom Masked Multihead Attention layer
+# -----------------------------
+@keras.utils.register_keras_serializable(package="Custom")
+class MaskedMultiHeadAttention(keras.layers.Layer):
+    """
+    Multi-head attention implemented with MaskedDense linear projections so that
+    q/k/v and output projections are prunable/regrowable via MaskedDense.mask/conn_mask.
+    Keeps API similar to keras.layers.MultiHeadAttention: call(query, key, value, training=None, mask=None)
+    """
+
+    def __init__(self, d_model, num_heads, dropout=0.0, name="masked_mha", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.d_model = int(d_model)
+        self.num_heads = int(num_heads)
+        if self.d_model % max(1, self.num_heads) != 0:
+            raise ValueError("d_model must be divisible by num_heads")
+        self.head_dim = self.d_model // max(1, self.num_heads)
+        self.dropout = float(dropout)
+
+        # Use MaskedDense for projections so they are part of your pruning/regrow system
+        self.q_proj = MaskedDense(self.d_model, activation=None, name=f"{name}_q_proj")
+        self.k_proj = MaskedDense(self.d_model, activation=None, name=f"{name}_k_proj")
+        self.v_proj = MaskedDense(self.d_model, activation=None, name=f"{name}_v_proj")
+        self.out_proj = MaskedDense(self.d_model, activation=None, name=f"{name}_out_proj")
+        self._softmax = tf.keras.layers.Softmax(axis=-1)
+        if self.dropout > 0.0:
+            self._drop = tf.keras.layers.Dropout(self.dropout)
+        else:
+            self._drop = None
+
+    def build(self, input_shape):
+        # MaskedDense will initialize weights during its own build when called the first time
+        super().build(input_shape)
+
+    def _split_heads(self, x):
+        # x: (batch, seq_len, d_model) -> (batch, num_heads, seq_len, head_dim)
+        b, seq = tf.shape(x)[0], tf.shape(x)[1]
+        x = tf.reshape(x, (b, seq, self.num_heads, self.head_dim))
+        return tf.transpose(x, perm=(0, 2, 1, 3))
+
+    def _combine_heads(self, x):
+        # x: (batch, num_heads, seq_len, head_dim) -> (batch, seq_len, d_model)
+        x = tf.transpose(x, perm=(0, 2, 1, 3))
+        b = tf.shape(x)[0]; seq = tf.shape(x)[1]
+        return tf.reshape(x, (b, seq, self.d_model))
+
+    def call(self, query, key, value, training=None, mask=None):
+        """
+        query/key/value: (batch, seq_len, d_model)
+        mask: optional attention mask compatible with scores shape (batch, num_heads, seq_q, seq_k)
+        returns: (batch, seq_len_q, d_model)
+        """
+        # project
+        q = self.q_proj(query)   # (batch, seq_q, d_model)
+        k = self.k_proj(key)     # (batch, seq_k, d_model)
+        v = self.v_proj(value)   # (batch, seq_k, d_model)
+
+        # split heads
+        qh = self._split_heads(q)  # (b, nh, seq_q, head_dim)
+        kh = self._split_heads(k)  # (b, nh, seq_k, head_dim)
+        vh = self._split_heads(v)  # (b, nh, seq_k, head_dim)
+
+        # scaled dot-product
+        scale = tf.cast(tf.math.sqrt(tf.cast(self.head_dim, tf.float32)), tf.float32)
+        # scores: (b, nh, seq_q, seq_k)
+        scores = tf.matmul(qh, kh, transpose_b=True) / (scale + 1e-12)
+
+        if mask is not None:
+            # Assume mask is broadcastable to (b, nh, seq_q, seq_k)
+            scores = tf.where(tf.cast(mask, dtype=tf.bool), scores, tf.fill(tf.shape(scores), -1e9))
+
+        attn = self._softmax(scores)  # (b, nh, seq_q, seq_k)
+        if self._drop is not None:
+            attn = self._drop(attn, training=training)
+
+        # attention output
+        context = tf.matmul(attn, vh)  # (b, nh, seq_q, head_dim)
+        combined = self._combine_heads(context)  # (b, seq_q, d_model)
+
+        out = self.out_proj(combined)  # (b, seq_q, d_model)
+        return out
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({'d_model': int(self.d_model), 'num_heads': int(self.num_heads), 'dropout': float(self.dropout)})
+        return cfg
+
+    @classmethod
+    def from_config(cls, cfg):
+        return cls(**cfg)
+        
 
 # -----------------------------
 # Custom Masked Dense layer
@@ -1825,10 +2198,6 @@ def build_transformer_model(seq_len, d_model, num_layers, num_heads, ff_dim):
     model = keras.Model(inp, out)
     return model
 
-model = build_transformer_model(CONFIG['seq_len'], d_model=CONFIG['d_model'], num_layers=CONFIG['hidden_layers'],
-                                num_heads=CONFIG['num_heads'], ff_dim=CONFIG['hidden_units'])
-optim = keras.optimizers.AdamW(CONFIG['learning_rate'])
-model.compile(optim, loss='huber', metrics=['mae'])
 
 # -----------------------------
 # Utilities: robust discovery of MaskedDense sublayers (recursive)
@@ -2069,7 +2438,7 @@ def compute_activation_entropy(activations, eps=1e-9):
 
 # ------------------- monkeypatch capture manager --------------------------------
 @contextmanager
-def monkeypatch_capture_layers(layers: Iterable[tf.keras.layers.Layer],
+def monkeypatch_capture_layers(layers: Iterable[keras.layers.Layer],
                                *, record_tensors: bool = True, force_eager: bool = True):
     """
     Temporarily monkeypatch layer.call to capture raw outputs produced in a forward pass.
@@ -2388,9 +2757,6 @@ def approx_fisher_per_sample(model: keras.Model,
         fisher[name] = fisher[name] / float(count + 1e-9)
     return fisher
 
-# -------------------------------------------------------------------------------------------------------
-# -------------------------------------------------------------------------------------------------------
-# -------------------------------------------------------------------------------------------------------
 
 def run_experiment(model, train_ds, val_ds, config, mask_thresh_min):
     os.makedirs(config.get('log_dir', './logs'), exist_ok=True)
@@ -2524,13 +2890,18 @@ def run_experiment(model, train_ds, val_ds, config, mask_thresh_min):
 
     # final save
     model.save(os.path.join(log_dir, 'final_model.keras'), overwrite=True, include_optimizer=True)
-    return model, compressor
+
+
+def main():
+    optim = keras.optimizers.AdamW(CONFIG['learning_rate'])
+    
+    model = build_transformer_model(CONFIG['seq_len'], d_model=CONFIG['d_model'], num_layers=CONFIG['hidden_layers'],
+                                    num_heads=CONFIG['num_heads'], ff_dim=CONFIG['hidden_units'])
+    model.compile(optim, loss='huber', metrics=['mae'])
+    
+    run_experiment(model, train_ds, val_ds, CONFIG, MASK_THRESH_MIN)    
 
 # ------------ Main ------------ #
 if __name__ == '__main__':
-    trained_model, compressor = run_experiment(model, train_ds, val_ds, CONFIG, MASK_THRESH_MIN)
-    print('\nFinal alive neuron counts per masked layer:')
-    md_layers = get_masked_dense_layers(trained_model)
-    # for l in md_layers:
-    #     print(f"{l.name}_{hex(id(l))}", int(l.mask.numpy().sum()), '/', l.units)
-    print('Logs and snapshots saved to', CONFIG['log_dir'])
+
+    main()
